@@ -15,7 +15,10 @@
 | 用途 | 端点 | 凭证形态 | 无痕验证 |
 |------|------|----------|----------|
 | 推理（主） | `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages` | Coding Plan JWT | **需要** |
-| 推理（回退） | `https://api.z.ai/api/anthropic/v1/messages` | Z.AI API Key | 不需要 |
+| 推理（国内站 API Key，默认） | `https://open.bigmodel.cn/api/anthropic/v1/messages` | BigModel API Key | 不需要 |
+| 推理（国际站 API Key） | `https://api.z.ai/api/anthropic/v1/messages` | Z.AI API Key | 不需要 |
+| 国内站授权页 / 兑换 | `https://bigmodel.cn/login`、`https://bigmodel.cn/api/biz/*` | OAuth access_token | — |
+| 国际站兑换 | `https://api.z.ai/api/auth/z/login`、`https://api.z.ai/api/biz/*` | OAuth access_token → biz token | — |
 | 计费 / 套餐 | `https://zcode.z.ai/api/v1/zcode-plan/billing/current` | JWT | 不需要 |
 | 额度 | `https://zcode.z.ai/api/v1/zcode-plan/billing/balance` | JWT | 不需要 |
 | 用量 | `https://zcode.z.ai/api/v1/zcode-plan/usage` | JWT | 不需要 |
@@ -23,7 +26,8 @@
 | OAuth 初始化 | `https://zcode.z.ai/api/v1/oauth/cli/init` | 临时 poll token | — |
 | OAuth 轮询 | `https://zcode.z.ai/api/v1/oauth/cli/poll/{flow_id}` | 临时 poll token | — |
 
-三者（主/回退/计费）在本插件里分别由 `ZCODE_BASE_URL` / `ZAI_FALLBACK_URL` / `ZCODE_BILLING_BASE` 覆盖。
+推理/兑换端点在本插件里分别由 `ZCODE_BASE_URL` / `BIGMODEL_ANTHROPIC_URL` / `ZAI_FALLBACK_URL` /
+`BIGMODEL_API_BASE_URL` / `ZAI_API_BASE` / `ZCODE_BILLING_BASE` 覆盖。
 
 **【实测】`/api/v1/client/configs` 不能带任何查询参数。**
 带 `?app_version=…&platform=…` 会返回 `{"code":3001,"msg":"parameter error"}`；
@@ -77,25 +81,29 @@ Coding Plan（JWT）模式**必需**，API Key 模式不需要。
 
 - **Coding Plan 凭证** = OAuth 产出的 JWT，三段点分（`a.b.c`）。本插件以此作为形态判据。
 - **官方对 Coding Plan 额度的真实用法不是打 zcode-plan 端点**，而是把 OAuth `access_token`
-  兑换成一个长期 API Key，再打 api.z.ai（免无痕验证）。见下。
+  兑换成一个长期 API Key，再打对应站点的 Anthropic 兼容端点（国内 `open.bigmodel.cn`、
+  国际 `api.z.ai`），**均免无痕验证**。见下。
 
 ### 4.1 OAuth 登录流程（`createZaiCliOAuthClient` / `Xun`）
 
 ```
 本地生成 pollToken = randomBytes(32).hex
-POST {oauthBase}/oauth/cli/init   Authorization: Bearer <pollToken>   {"provider":"zai"}
+POST {oauthBase}/oauth/cli/init   Authorization: Bearer <pollToken>   {"provider":"zai" | "bigmodel"}
      → data: { flow_id, authorize_url, poll_token, expires_at, poll_interval_sec }
 浏览器完成授权
 GET  {oauthBase}/oauth/cli/poll/{flow_id}   Authorization: Bearer <pollToken>
      → status: pending | failed | ready
-     ready 时 data = { token: <CodingPlan JWT>, zai: { access_token }, user: {...} }
+     ready 时 data = { token: <CodingPlan JWT>, zai: { access_token }, bigmodel: { access_token }, user: {...} }
 ```
 
 - `oauthBase` 默认 `https://zcode.z.ai/api/v1`（bundle 里 `J5s`）
+- `provider` 决定授权站点（**实测**）：
+  - `bigmodel` → `https://bigmodel.cn/login?appId=zcode&redirect=https://zcode.z.ai/api/v1/oauth/cli/callback/bigmodel&state=…`
+  - `zai` → `chat.z.ai`
 - 轮询用的临时 `pollToken` 由本地随机生成，与最终凭证无关
 - 轮询间隔取 `max(Fqa, poll_interval_sec*1000)`，超时取 `min(now+timeout, expires_at*1000)`
 
-### 4.2 ★ 兑换链：access_token → api.z.ai API Key（`createCodingPlanApiKeyResolver` / `ZJr`）
+### 4.2 ★ 国际站兑换链：access_token → api.z.ai API Key（`createCodingPlanApiKeyResolver` / `ZJr`）
 
 **这是绕开无痕验证 F001 的关键路线**，官方客户端 `resolveCodingPlanApiKey`（`nWo`）实际调用：
 
@@ -125,17 +133,82 @@ GET  {oauthBase}/oauth/cli/poll/{flow_id}   Authorization: Bearer <pollToken>
   - `GET /api/biz/customer/getCustomerInfo`（无 auth）→ `{code:1001,msg:"Authentication parameter not received"}`
   - 同端点（假 biz token）→ `{code:401,msg:"token expired or incorrect"}`
 
-### 4.3 兑换出的 key 如何推理
+### 4.3 兑换出的 key 如何推理（按站点）
 
 - 兑换结果 `apiKeyId.secretKey` 只有 **1 个点** → 本插件 `classifySecret` 判为 `apiKey`
-  → 自动走 `ZAI_FALLBACK_URL`（`https://api.z.ai/api/anthropic/v1/messages`），**免无痕验证**
-- 佐证：`builtinProviders` 里 `builtin:zai-coding-plan` 的 `baseUrl` 正是 `https://api.z.ai/api/anthropic`
-- **【实测】** 该端点用假 key 返回 `401 {message:"token expired or incorrect"}`，把值当 token 解析，不要求验证码头
+  → 按 `ZCODE_SITE` 选端点，**免无痕验证**：
+  - 国内站（默认）→ `BIGMODEL_ANTHROPIC_URL` = `https://open.bigmodel.cn/api/anthropic/v1/messages`
+  - 国际站 → `ZAI_FALLBACK_URL` = `https://api.z.ai/api/anthropic/v1/messages`
+- 佐证：`builtinProviders` 里 `builtin:zai-coding-plan` 的 `baseUrl` 是
+  `https://api.z.ai/api/anthropic`；`builtin:bigmodel-coding-plan` 的 baseUrl 是
+  `https://open.bigmodel.cn/api/anthropic`
+- **【实测】** 两个端点用假 key 都返回 `401 {message:"token expired or incorrect"}`，
+  把值当 token 解析，不要求验证码头
 
 ### 4.4 zcode2api 的对应实现
 
 zcode2api 的 `app/oauth.py::exchange_api_key` 是同一条链（`z/login → getCustomerInfo →
 api_keys → copy`）。本插件的 `src/zcode/exchange.ts` 与之等价，但**默认启用**（zcode2api 里是可选步骤）。
+
+### 4.5 ★ 国内站兑换链：access_token 直接作 Bearer（3 步）
+
+国内站（`provider:"bigmodel"`）**没有** `/api/auth/z/login` 这一步。官方 bundle 的
+`resolveCodingPlanApiKey` 按 provider 分支：bigmodel 直接拿 OAuth ready 里的
+`data.bigmodel.access_token` 当业务 Bearer，base 为 `https://bigmodel.cn`：
+
+```
+输入：OAuth ready 里的 bigmodel.access_token（注意：不是 JWT！）
+
+1. GET https://bigmodel.cn/api/biz/customer/getCustomerInfo
+     Authorization: Bearer <access_token>
+   → pickOrgAndProject：机构挑名字含「默认机构」的（否则第一个），
+     项目挑名字含「默认项目」的（否则第一个）
+2. GET https://bigmodel.cn/api/biz/v1/organization/{orgId}/projects/{projId}/api_keys
+   → 找 name === "zcode-api-key" 的项；没有则 POST 同 URL {name:"zcode-api-key"}
+   → 取 apiKeyId = item.apiKey
+3. GET .../api_keys/copy/{apiKeyId}
+   → data.secretKey
+  ⇒ 返回 `${apiKeyId}.${secretKey}`
+```
+
+> **当前 bundle（3.5.3）的实现差异**：新版 `createCodingPlanApiKeyResolver` 不再调用
+> `/copy/{id}`，而是 `POST .../api_keys/{apiKeyId}/access_tokens`
+> `{clientType:"zcode",clientVersion}` 换一个**短时项目 token**（`token` 字段），并把它
+> 与 `organizationId` / `projectId` 一起作为推理凭证。旧 `/copy/{id}` 端点**仍存活**
+> （假 token → `401`，不是 404），本插件采用它来获得可长期存放的 `secretKey`。
+> 新版对 BigModel 的 `getCustomerInfo` / `api_keys` 发裸 `Authorization`（不带 `Bearer`），
+> 对 Z.AI 的 `api_keys` 才发 `Bearer`；假 token 无法区分前缀，本插件统一用 `Bearer`，
+> 留待真实账号验证。
+
+**【实测·2026-10-20】**：
+
+```
+GET  https://bigmodel.cn/api/biz/customer/getCustomerInfo（假 token）
+     → 401 {"msg":"token expired or incorrect"}      // 端点存活，鉴权语义与 Z.AI 一致
+GET  https://open.bigmodel.cn/api/paas/v4/models（假 key）
+     → 401                                          // capture-key 探活端点可用
+POST https://open.bigmodel.cn/api/anthropic/v1/messages（假 x-api-key）
+     → 401 {"message":"token expired or incorrect"} // 推理端点存活，不要求验证码头
+GET  https://zcode.z.ai/api/v1/client/configs
+     → builtinProviders 含 builtin:bigmodel-coding-plan，baseUrl = https://open.bigmodel.cn/api/anthropic
+```
+
+**【实测·真实账号·2026-10-20】**（`pnpm run login` → `pnpm capture-key` → `pnpm serve`）：
+
+```
+OAuth（provider=bigmodel）→ 浏览器授权 bigmodel.cn → ready 返回 bigmodel.access_token
+兑换链 3 步（getCustomerInfo → api_keys → copy）→ apiKeyId.secretKey（49 字符，1 个点）
+GET  https://open.bigmodel.cn/api/paas/v4/models（兑换出的 key）→ 200
+POST https://open.bigmodel.cn/api/anthropic/v1/messages（经本插件）
+     → HTTP 429 {"error":{"type":"rate_limit_error","code":"1310",
+        "message":"[1310][您已达到每周/每月使用上限，您的限额将在 2026-10-22 11:23:27 重置。]"}}
+```
+
+结论：
+
+- **旧 `/copy` 兑换链在真实账号上仍可用**，产出的是形如 `apiKeyId.secretKey` 的长期 key
+- 兑换 key 通过 BigModel 鉴权；推理请求被套餐额度上限（1310）拒绝而非 401
+- 额度重置时间来自上游响应；成功后是否按订阅额度扣减，仍需 `billing/balance` 前后对账
 
 ## 5. 模型清单
 
@@ -197,7 +270,7 @@ api_keys → copy`）。本插件的 `src/zcode/exchange.ts` 与之等价，但*
 | 补 canvas / WebGL / Worker / OffscreenCanvas 指纹桩 | 仍 F001 |
 
 **这意味着 Coding Plan（JWT）路径在本项目当前的实现下无法取到合法的 verifyParam。**
-API Key 路径不受影响（`api.z.ai` 回退端点不需要验证码）。
+API Key 路径不受影响（国内站 `open.bigmodel.cn` / 国际站 `api.z.ai` 的兼容端点都不需要验证码）。
 
 可能的出路见 `README.md` 的「已知限制」一节。
 
@@ -230,7 +303,7 @@ POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages
 ```
 
 即：**手里的 JWT 既不能直接打 api.z.ai，也不能喂进兑换链**。兑换链要的是 OAuth 授权返回的
-`zai.access_token`（见第 4.1 节 ready 载荷）。所以路线 A 必须走完整 `pnpm login`（OAuth 授权
+`zai.access_token`（见第 4.1 节 ready 载荷）。所以路线 A 必须走完整 `pnpm run login`（OAuth 授权
 → 拿 access_token → 兑换），无法用现成的 JWT 走捷径。这也解释了为何第 7 节把
 「路线 A 端到端」列为头号待验证项——它需要一次真实 OAuth 授权才能跑通。
 
@@ -314,21 +387,29 @@ const UNSIGNED_PATHS = new Set([
 | 3012 unusual activity | ⛔ **账号级风控** | 四组对照实验证实，cookie/session 无法绕过 |
 | V4 签名 | ✗ **不适用** | TriDefender 代码确认 zcode-plan 端点官方也不签 |
 
-**代码完整可用**：`captcha/solver.cjs` 已硬化，求解链路完整，e2e 53/53 全绿。阻塞项是该 JWT 账号被 ESA WAF 标记——这是风控策略问题，不是代码缺陷。
+**代码完整可用**：`captcha/solver.cjs` 已硬化，求解链路完整，`pnpm e2e` 69/69 全绿。阻塞项是该 JWT 账号被 ESA WAF 标记——这是风控策略问题，不是代码缺陷。
 
 **出路**：
 - 账号冷却（等待风控标记过期，时间不确定）
 - 用另一个未被标记的 start-plan 账号验证（应该能直接通）
-- 付费 Coding Plan 走 exchange.ts 兑换链（api.z.ai 免验证码路线）
+- 付费 Coding Plan 走 exchange.ts 兑换链（默认国内站 `open.bigmodel.cn`，国际站 `api.z.ai`，均免验证码）
 
 ---
 
 ## 7. 未验证 / 存疑事项
 
-- **【头号】兑换 key 的计费归属未端到端确证**：逆向证明官方把 Coding Plan 的 access_token
-  兑换成 `zcode-api-key` 打 api.z.ai，但**无法证明这把 key 消耗的是订阅额度还是另计的 API 余额**。
-  需要一个真实订阅账号端到端跑通（`pnpm login` → `pnpm serve` → 发一条请求 → 查
-  `billing/balance` 是否扣减）才能确认。这是路线 A 成立与否的最后一环。
+- **【头号】兑换 key 的计费归属尚未完成扣减对账**：逆向证明官方把 Coding Plan 的 access_token
+  兑换成 `zcode-api-key` 打对应站点的兼容端点（国内 `open.bigmodel.cn`、国际 `api.z.ai`）。
+  2026-10-20 国内站真实账号已验证：登录/兑换成功、key 探活 200、推理端点返回套餐额度上限
+  `1310`（非 401）——说明 key 与账户套餐额度绑定。但还没做 `billing/balance` 前后对比，
+  无法排除「另计 API 余额」的可能。这是路线 A 成立与否的最后一环。
+- **【国内站·已验证】OAuth → `/copy` 兑换链在真实账号上跑通**（2026-10-20）：产出 49 字符
+  `apiKeyId.secretKey`，可过 BigModel 鉴权。**尚未**完成的是额度重置后的成功生成
+  （当前账号 1310 限额，2026-10-22 11:23:27 重置）
+- **【已解决】`Authorization` 前缀**：真实账号下 BigModel 业务请求用 `Bearer <access_token>`
+  成功完成 getCustomerInfo / api_keys / copy，本插件统一 `Bearer` 的做法有效
+- **【已解决】旧 `/copy` 端点**：3.5.3 bundle 虽改用 `/api_keys/{id}/access_tokens` 换短时
+  项目 token，但旧 `/copy/{id}` 在真实账号上仍返回可用的长期 `secretKey`（D-12）
 - `billing/current`、`billing/balance`、`usage` 的字段结构（`total_units` / `used_units` /
   `remaining_units` / `expires_at` 等）来自转述，不同套餐可能不一致
 - 额度耗尽的判定关键词为启发式

@@ -1,17 +1,23 @@
 #!/usr/bin/env tsx
 /**
- * scripts/login.ts — `pnpm login`：OAuth 登录 → 兑换成免验证码的 api.z.ai API Key。
+ * scripts/login.ts — `pnpm run login`：OAuth 登录 → 兑换成免验证码的长期 API Key。
+ *
+ * 【默认国内站】ZCODE_SITE 默认 `bigmodel`：OAuth init 传 `provider:"bigmodel"`，
+ * 服务端返回的授权页是 https://bigmodel.cn/login；兑换走 bigmodel.cn/api/biz/*，
+ * 得到的 API Key 打 https://open.bigmodel.cn/api/anthropic（免无痕验证）。
+ * 国际站用 `ZCODE_SITE=zai`：授权页 chat.z.ai，兑换走 api.z.ai。
  *
  * 【为什么不是直接存 JWT】逆向 ZCode 官方客户端发现：官方对 Coding Plan 额度
- * 走的是「兑换成长期 API Key → 打 api.z.ai/api/anthropic（免无痕验证）」，
- * 而不是「JWT → zcode-plan 端点 + 阿里云无痕验证」。后者当前被风控拒（F001）。
+ * 走的是「兑换成长期 API Key → 打各站点的 Anthropic 兼容端点（免无痕验证）」，
+ * 而不是「JWT → zcode-plan 端点 + 阿里云无痕验证」。后者当前被风控拒。
  * 所以本脚本默认存**兑换后的 API Key**，让转发层自动走免验证码分支。
- * 详见 docs/reverse/ZCODE_REVERSE.md 第 4 节与 docs/DECISIONS.md D-10。
+ * 详见 docs/reverse/ZCODE_REVERSE.md 第 4/8 节与 docs/DECISIONS.md D-10/D-12。
  *
  * 流程：
  *   1. POST {oauthBase}/oauth/cli/init      → flow_id / authorize_url（poll_token 本地随机生成）
- *   2. 浏览器授权
- *   3. GET  {oauthBase}/oauth/cli/poll/{id} → 轮询至 status=ready，取 zai.access_token（及 token=JWT）
+ *   2. 浏览器授权（国内站 → bigmodel.cn，国际站 → chat.z.ai）
+ *   3. GET  {oauthBase}/oauth/cli/poll/{id} → 轮询至 status=ready，
+ *      取 data[provider].access_token（及 data.token=JWT）
  *   4. resolveCodingPlanApiKey(access_token) → `apiKeyId.secretKey`（免验证码凭证）
  *   5. 写回 .env 的 ZCODE_KEYS（合并、去重、不覆盖别的变量）
  *
@@ -46,7 +52,7 @@ async function initFlow(pollToken: string): Promise<InitResult> {
   const resp = await fetch(`${OAUTH_BASE}/oauth/cli/init`, {
     method: 'POST',
     headers: { authorization: `Bearer ${pollToken}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ provider: 'zai' }),
+    body: JSON.stringify({ provider: settings.site }),
     signal: AbortSignal.timeout(30_000),
   });
   if (!resp.ok) throw new Error(`init 失败 HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
@@ -94,7 +100,10 @@ function persistKey(secret: string, hint: string): void {
 }
 
 async function main(): Promise<void> {
-  console.log('🔑 xrl-router-plugin · zcode 登录（OAuth → 兑换免验证码 API Key）\n');
+  const siteLabel =
+    settings.site === 'bigmodel' ? '国内站 BigModel（open.bigmodel.cn）' : '国际站 Z.AI（api.z.ai）';
+  console.log(`🔑 xrl-router-plugin · zcode 登录（OAuth → 兑换免验证码 API Key）`);
+  console.log(`   站点：${siteLabel}\n`);
 
   const pollToken = randomBytes(32).toString('hex');
 
@@ -128,21 +137,28 @@ async function main(): Promise<void> {
     }
     if (status !== 'ready') continue;
 
-    // ready 载荷（对齐官方 parseReadyData / tUs）：{ token: JWT, zai: { access_token }, user: {...} }
-    const accessToken: string | undefined = data?.zai?.access_token;
+    // ready 载荷（对齐官方 parseReadyData / Ota）：
+    // { token: JWT, zai: { access_token }, bigmodel: { access_token }, user: {...} }
+    // provider 字段名就是 "zai" / "bigmodel"
+    const providerData = data?.[settings.site] ?? {};
+    const accessToken: string | undefined =
+      providerData?.access_token ?? providerData?.accessToken;
     const jwt: string | undefined = data?.token;
 
     if (!accessToken && !jwt) {
-      fail('授权完成，但响应里既没有 zai.access_token 也没有 token，无法继续。');
+      fail(`授权完成，但响应里既没有 ${settings.site}.access_token 也没有 token，无法继续。`);
       return;
     }
 
-    // ── 首选：兑换成免验证码的 api.z.ai API Key ──
+    // ── 首选：兑换成免验证码的长期 API Key ──
     if (accessToken) {
-      console.log('   正在把 OAuth 凭证兑换成 api.z.ai API Key（免无痕验证）…');
+      console.log('   正在把 OAuth 凭证兑换成长期 API Key（免无痕验证）…');
       try {
         const exchanged = await resolveCodingPlanApiKey(accessToken);
-        persistKey(exchanged.apiKey, '免验证码 · 走 api.z.ai');
+        persistKey(
+          exchanged.apiKey,
+          settings.site === 'bigmodel' ? '免验证码 · 走 open.bigmodel.cn' : '免验证码 · 走 api.z.ai',
+        );
         if (exchanged.organizationName || exchanged.projectName) {
           console.log(`   机构/项目：${exchanged.organizationName ?? '?'} / ${exchanged.projectName ?? '?'}`);
         }
@@ -166,7 +182,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  fail('登录超时，请重新执行 pnpm login。');
+  fail('登录超时，请重新执行 pnpm run login。');
 }
 
 main().catch((err) => {

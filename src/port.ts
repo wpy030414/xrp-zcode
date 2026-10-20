@@ -1,57 +1,36 @@
 /**
- * port.ts — 释放被占用的端口（跨平台）。
+ * port.ts — 端口占用探测。
  *
- * 插件被 `Ctrl+C` 或异常终止时可能留下僵尸监听进程，下次启动会 EADDRINUSE。
- * 启动前先杀掉占用者；**排除自身 PID**，避免热重启场景下自杀。
+ * V24 契约要求 `serve` 幂等：端口已有实例在监听时**干净退出**，不得抢占。
+ * 因此这里只探测、不杀进程（旧实现会 taskkill/lsof 杀掉占用者，已废弃）。
  */
 
-import { spawn } from 'node:child_process';
+import net from 'node:net';
 
-export function killPortProcess(port: number): Promise<void> {
-  const selfPid = String(process.pid);
-
+/** 在指定 host 上试绑一次，返回是否不可用 */
+function probe(port: number, host: string): Promise<boolean> {
   return new Promise((resolve) => {
-    if (process.platform === 'win32') {
-      const netstat = spawn('netstat', ['-ano']);
-      let output = '';
-      netstat.stdout.on('data', (d) => {
-        output += d.toString();
-      });
-      netstat.on('error', () => resolve());
-      netstat.on('close', () => {
-        const pids: string[] = [];
-        for (const line of output.split('\n')) {
-          if (!line.includes(`:${port}`) || !line.includes('LISTENING')) continue;
-          const parts = line.trim().split(/\s+/);
-          const pid = parts[parts.length - 1];
-          if (pid && pid !== selfPid && !pids.includes(pid)) pids.push(pid);
-        }
-        if (pids.length === 0) return resolve();
-        const taskkill = spawn('taskkill', ['/F', '/PID', ...pids]);
-        taskkill.on('error', () => resolve());
-        taskkill.on('close', () => resolve());
-      });
-      return;
-    }
+    const server = net.createServer();
 
-    const lsof = spawn('lsof', ['-ti', `:${port}`]);
-    let pids = '';
-    lsof.stdout.on('data', (d) => {
-      pids += d.toString();
+    server.once('error', (err: NodeJS.ErrnoException) => {
+      resolve(err.code === 'EADDRINUSE' || err.code === 'EACCES');
     });
-    lsof.stderr.on('data', () => {});
-    lsof.on('error', () => resolve());
-    lsof.on('close', (code) => {
-      if (code !== 0 || !pids.trim()) return resolve();
-      const list = pids
-        .trim()
-        .split('\n')
-        .map((p) => p.trim())
-        .filter((p) => p && p !== selfPid);
-      if (list.length === 0) return resolve();
-      const kill = spawn('kill', ['-9', ...list]);
-      kill.on('error', () => resolve());
-      kill.on('close', () => resolve());
+
+    server.once('listening', () => {
+      server.close(() => resolve(false));
     });
+
+    server.listen(port, host);
   });
+}
+
+/**
+ * 端口是否已被监听（EACCES 也视为不可用，启动方应退出）。
+ *
+ * 同时探测 loopback 与通配地址：Windows 上「127.0.0.1 已监听」时再绑
+ * 0.0.0.0 仍可能成功，只探一个会漏判。
+ */
+export async function isPortInUse(port: number): Promise<boolean> {
+  if (await probe(port, '127.0.0.1')) return true;
+  return probe(port, '0.0.0.0');
 }

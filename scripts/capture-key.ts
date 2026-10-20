@@ -46,10 +46,14 @@ function formatUnits(value: unknown): string {
 
 /**
  * 体检一个 API Key 形态的凭证（`apiKeyId.secretKey`，即 OAuth 兑换出的免验证码 key）。
- * 用 api.z.ai 的 paas /models（轻量 GET）探活：假 key 返回 401，有效 key 返回 200。
+ * 用对应站点的 paas /models（轻量 GET）探活：假 key 返回 401，有效 key 返回 200。
  */
 async function probeApiKey(apiKey: string): Promise<ProbeOutcome> {
-  const probeUrl = `${settings.zaiApiBase}/api/paas/v4/models`;
+  const isBigmodel = settings.site === 'bigmodel';
+  const probeUrl = `${isBigmodel ? settings.bigmodelOpenBase : settings.zaiApiBase}/api/paas/v4/models`;
+  const label = isBigmodel
+    ? 'API Key（国内站 · open.bigmodel.cn）'
+    : 'API Key（国际站 · api.z.ai）';
   try {
     const resp = await fetch(probeUrl, {
       headers: { authorization: `Bearer ${apiKey}` },
@@ -58,26 +62,26 @@ async function probeApiKey(apiKey: string): Promise<ProbeOutcome> {
     if (resp.status === 401 || resp.status === 403) {
       const text = (await resp.text()).slice(0, 160);
       return {
-        label: 'API Key（免验证码 · 走 api.z.ai）',
-        detail: `      探活失败 HTTP ${resp.status}：${text}\n      → 密钥无效或已过期，重跑 pnpm login 重新兑换`,
+        label,
+        detail: `      探活失败 HTTP ${resp.status}：${text}\n      → 密钥无效或已过期，重跑 pnpm run login 重新兑换`,
         healthy: false,
       };
     }
     if (!resp.ok) {
       return {
-        label: 'API Key（免验证码 · 走 api.z.ai）',
+        label,
         detail: `      探活返回 HTTP ${resp.status}（非 401，端点可达，密钥可能有效）`,
         healthy: true,
       };
     }
     return {
-      label: 'API Key（免验证码 · 走 api.z.ai）',
-      detail: '      探活成功（GET /api/paas/v4/models → 200），密钥有效',
+      label,
+      detail: `      探活成功（GET ${new URL(probeUrl).pathname} → 200），密钥有效`,
       healthy: true,
     };
   } catch (err) {
     return {
-      label: 'API Key（免验证码 · 走 api.z.ai）',
+      label,
       detail: `      探活异常：${(err as Error).message}`,
       healthy: false,
     };
@@ -148,10 +152,11 @@ async function main(): Promise<void> {
     .filter(Boolean);
 
   if (keys.length === 0) {
-    warn(`.env 里没有 ${KEYS_ENV_KEY}。先执行 pnpm login，或手动写入 ZCODE_KEYS=<jwt>`);
+    warn(`.env 里没有 ${KEYS_ENV_KEY}。先执行 pnpm run login，或手动写入 ZCODE_KEYS=<jwt>`);
     return;
   }
 
+  console.log(`站点：${settings.site === 'bigmodel' ? '国内站 BigModel' : '国际站 Z.AI'}`);
   console.log(`计费端点：${settings.billingBase}`);
   console.log(`共 ${keys.length} 个凭证\n`);
 
@@ -162,7 +167,7 @@ async function main(): Promise<void> {
     const kind = classifySecret(secret);
     console.log(`── [${i + 1}/${keys.length}] ${maskSecret(secret)} ─────────────────`);
 
-    // 两种形态各自探活：apiKey 走 api.z.ai（免验证码主路线），JWT 走 zcode-plan 计费端点
+    // 两种形态各自探活：apiKey 走对应站点的开放平台（免验证码主路线），JWT 走 zcode-plan 计费端点
     const outcome = kind === 'apiKey' ? await probeApiKey(secret) : await probeJwt(secret);
     console.log(`   形态：${outcome.label}`);
     console.log(outcome.detail);
@@ -170,7 +175,7 @@ async function main(): Promise<void> {
       healthyCount++;
       ok('该凭证可用');
     } else {
-      warn('该凭证查询失败——可能已过期，重跑 pnpm login');
+      warn('该凭证查询失败——可能已过期，重跑 pnpm run login');
     }
     console.log('');
   }

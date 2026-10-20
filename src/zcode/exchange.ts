@@ -1,28 +1,34 @@
 /**
- * zcode/exchange.ts — 把 ZCode 的 OAuth access_token 兑换成 api.z.ai 的长期 API Key。
+ * zcode/exchange.ts — 把 OAuth access_token 兑换成长期 API Key。
  *
  * 【这是绕开阿里云无痕验证 F001 的关键】逆向自 ZCode 官方客户端
  * （app.asar → glm/zcode.cjs 的 createCodingPlanApiKeyResolver / resolveZaiBizToken /
- *  resolveBizApiKey），详见 docs/reverse/ZCODE_REVERSE.md 第 4 节。
+ *  resolveBizApiKey），详见 docs/reverse/ZCODE_REVERSE.md 第 4 节与第 8 节。
  *
  * 官方对 Coding Plan（订阅额度）的真实用法**不是**打 zcode-plan 端点+无痕验证，
  * 而是把 OAuth access_token 兑换成一个名为 "zcode-api-key" 的长期 API Key
- * （形态 `apiKeyId.secretKey`），再用它打 `api.z.ai/api/anthropic/v1/messages`——
- * 该端点**不需要无痕验证**。builtinProviders 里 `builtin:zai-coding-plan` 的
- * baseUrl 正是 `https://api.z.ai/api/anthropic`，与此闭环。
+ * （形态 `apiKeyId.secretKey`），再用它打各站点的 Anthropic 兼容端点——该端点
+ * **不需要无痕验证**。
  *
- * 兑换链（全部纯 HTTP，运行时零客户端依赖）：
- *   1. POST {zaiApiBase}/api/auth/z/login {token: accessToken}      → bizToken
- *   2. GET  {zaiApiBase}/api/biz/customer/getCustomerInfo           → 机构/项目
- *   3. GET  .../organization/{org}/projects/{proj}/api_keys         → 找 "zcode-api-key"
- *      （没有则 POST 同 URL {name:"zcode-api-key"} 创建）
- *   4. GET  .../api_keys/copy/{apiKeyId}                            → secretKey
- *   ⇒ 返回 `${apiKeyId}.${secretKey}`
+ * 两条兑换链（按 ZCODE_SITE 分流）：
+ *
+ * 国内站 BigModel（默认）：
+ *   1. GET  {bigmodelApiBase}/api/biz/customer/getCustomerInfo           → 机构/项目
+ *   2. GET  .../organization/{org}/projects/{proj}/api_keys              → 找/建 "zcode-api-key"
+ *   3. GET  .../api_keys/copy/{apiKeyId}                                 → secretKey
+ *   （OAuth access_token 直接作为 Bearer，无需 /api/auth/z/login）
+ *   ⇒ API Key 打 https://open.bigmodel.cn/api/anthropic
+ *
+ * 国际站 Z.AI（ZCODE_SITE=zai）：
+ *   1. POST {zaiApiBase}/api/auth/z/login {token: accessToken}           → bizToken
+ *   2. GET  {zaiApiBase}/api/biz/customer/getCustomerInfo                → 机构/项目
+ *   3. GET  .../api_keys（没有则创建）→ GET .../copy/{apiKeyId}          → secretKey
+ *   ⇒ API Key 打 https://api.z.ai/api/anthropic
  *
  * 上游业务码约定（COe/G5s）：code 为 null/0/200/"0"/"200" 视为成功，其余抛错。
  */
 
-import { settings } from '../config';
+import { settings, type ZcodeSite } from '../config';
 
 /** 兑换出的 API Key，形如 `<apiKeyId>.<secretKey>` */
 export interface ExchangedKey {
@@ -74,9 +80,20 @@ async function requestRemoteData(
   return payload?.data ?? null;
 }
 
-/** 第 1 步：OAuth access_token → api.z.ai 业务 token */
-export async function resolveZaiBizToken(accessToken: string): Promise<string> {
-  const data = await requestRemoteData(`${settings.zaiApiBase}/api/auth/z/login`, {
+export interface ExchangeOptions {
+  /** 覆盖 settings.site（e2e 用来在一次进程内验证两条链） */
+  site?: ZcodeSite;
+  /** 覆盖 BigModel / Z.AI 业务根（e2e 指向 mock） */
+  bigmodelApiBase?: string;
+  zaiApiBase?: string;
+}
+
+/** 第 1 步（仅国际站）：OAuth access_token → api.z.ai 业务 token */
+export async function resolveZaiBizToken(
+  accessToken: string,
+  base: string = settings.zaiApiBase,
+): Promise<string> {
+  const data = await requestRemoteData(`${base}/api/auth/z/login`, {
     method: 'POST',
     body: JSON.stringify({ token: accessToken }),
   });
@@ -107,13 +124,13 @@ function pickOrgAndProject(customerInfo: any): {
   };
 }
 
-/** 第 2-4 步：业务 token → 找/建 "zcode-api-key" → 取 secretKey */
+/** 第 2-4 步：业务鉴权头 → 找/建 "zcode-api-key" → 取 secretKey */
 export async function resolveBizApiKey(
-  bizToken: string,
-  opts: { requireSecretKey?: boolean } = {},
+  authorization: string,
+  opts: { base: string; requireSecretKey?: boolean },
 ): Promise<ExchangedKey> {
-  const auth = `Bearer ${bizToken}`;
-  const base = settings.zaiApiBase;
+  const auth = authorization;
+  const base = opts.base;
 
   const customerInfo = await requestRemoteData(
     `${base}/api/biz/customer/getCustomerInfo`,
@@ -158,12 +175,26 @@ export async function resolveBizApiKey(
 }
 
 /**
- * 完整兑换：OAuth access_token → 可直接使用的 api.z.ai API Key。
+ * 完整兑换：OAuth access_token → 可直接使用的 API Key。
  * 失败抛错（调用方决定是否回退到 JWT）。
  */
-export async function resolveCodingPlanApiKey(accessToken: string): Promise<ExchangedKey> {
+export async function resolveCodingPlanApiKey(
+  accessToken: string,
+  options: ExchangeOptions = {},
+): Promise<ExchangedKey> {
   const trimmed = (accessToken || '').trim();
   if (!trimmed) throw new Error('缺少 OAuth access_token');
-  const bizToken = await resolveZaiBizToken(trimmed);
-  return resolveBizApiKey(bizToken, { requireSecretKey: true });
+
+  const site = options.site ?? settings.site;
+  if (site === 'bigmodel') {
+    // 国内站：access_token 本身就是 BigModel 业务 token，无需 z/login
+    return resolveBizApiKey(`Bearer ${trimmed}`, {
+      base: options.bigmodelApiBase ?? settings.bigmodelApiBase,
+      requireSecretKey: true,
+    });
+  }
+
+  const zaiBase = options.zaiApiBase ?? settings.zaiApiBase;
+  const bizToken = await resolveZaiBizToken(trimmed, zaiBase);
+  return resolveBizApiKey(`Bearer ${bizToken}`, { base: zaiBase, requireSecretKey: true });
 }

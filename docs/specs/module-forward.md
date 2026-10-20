@@ -2,17 +2,31 @@
 
 ## 要构建什么
 
-`POST /v1/messages` 的处理链路：从入站请求取凭证 → 判定形态 → 装上游头 → 转发 → 按客户端期望返回流式或聚合结果，并把上游错误如实映射成 router 能读懂的信号。
+`POST /v1/messages` 的处理链路：插件自持凭据 → 判定形态 → 装上游头 → 转发 → 按客户端期望返回流式或聚合结果，并把上游错误如实映射成 router 能读懂的信号。
 
 实现：`src/zcode/client.ts`（主流程）、`src/zcode/auth.ts`（纯函数）、`src/zcode/aggregate.ts`（聚合）。
 
 ## 行为
 
-### 凭证提取
+### 凭据来源
 
-1. 优先 `x-api-key`（xrl-router 对 `kind=messages` 供应商注入此头）
-2. 其次 `Authorization: Bearer <token>`
-3. 都没有 → `401` + Anthropic 形态错误体
+- **只从 `settings.keys`（`ZCODE_KEYS`）取凭据**，按顺序尝试
+- 入站请求里的 `x-api-key` 是 router 注入的占位符 `xrl-router`，**必须忽略**
+- 对入站请求不做本地鉴权（router 已负责）；无本地凭据时才返回 `503 configuration_error`
+- 入站 `Authorization` 同样不使用，避免与占位符混淆
+
+### 多凭据故障转移
+
+```
+orderedKeys()：从 preferredKeyIndex 开始，环形遍历 settings.keys
+  ├─ 成功（2xx）→ preferredKeyIndex = 该 key 下标（粘性）
+  ├─ 401 / 402 / 403 / 429 → 记录错误，尝试下一把
+  └─ 其他错误 → 不换 key（不是凭据问题）
+```
+
+- 全部 key 都是凭证级错误时，原样透传**最后一把**的状态码与响应体
+- `preferredKeyIndex` 仅在进程内，不落盘
+- 验证码失败**不换 key**：同一把 key 刷新验证码重试，最终 502（换 key 对风控无意义）
 
 ### 形态判定
 
@@ -20,12 +34,15 @@
 
 ### 上游选择与请求头
 
-| 形态 | 端点 | 凭证头 | 无痕验证头 |
+| 形态 / 站点 | 端点 | 凭证头 | 无痕验证头 |
 |------|------|--------|-----------|
-| `jwt` | `ZCODE_BASE_URL` | `Authorization: Bearer` | 带上 |
-| `apiKey` | `ZAI_FALLBACK_URL` | `x-api-key` | 不带 |
+| `jwt`（两站点共用） | `ZCODE_BASE_URL` | `Authorization: Bearer` | 带上 |
+| `apiKey` + `bigmodel`（默认） | `BIGMODEL_ANTHROPIC_URL` | `x-api-key` | 不带 |
+| `apiKey` + `zai` | `ZAI_FALLBACK_URL` | `x-api-key` | 不带 |
 
-两种形态都带：`content-type`、`anthropic-version: 2023-06-01`、`user-agent`、`x-zcode-app-version`、`x-zcode-agent`、`http-referer`。
+所有形态都带：`content-type`、`anthropic-version: 2023-06-01`、`user-agent`。
+JWT 形态额外带 ZCode 身份头 `x-zcode-app-version` / `x-zcode-agent` / `http-referer`；
+国内站 API Key 走标准 Anthropic 兼容端点，**不带**这三个业务头；国际站 API Key 保留它们。
 
 ### 请求体
 
@@ -45,27 +62,29 @@
 | 上游响应 | 插件行为 |
 |----------|----------|
 | 2xx | 成功路径 |
-| 401 / 402 / 403（非验证码）/ 429 | 原样透传状态码与响应体 |
-| 403 / 400 且命中验证码关键词（`captcha` / `verify token` / `verify failed` / `verify_param` / `无痕` / `人机`） | `captchaManager.invalidate()` → 重试；连续 `MAX_CAPTCHA_REFRESH`(3) 次仍失败 → **502** |
+| 401 / 402 / 403（非验证码）/ 429 | 换下一把 key；全部失败则原样透传最后一把 |
+| 403 / 400 且命中验证码关键词（`captcha` / `verify token` / `verify failed` / `verify_param` / `无痕` / `人机`） | `captchaManager.invalidate()` → 同一把 key 重试；连续 `MAX_CAPTCHA_REFRESH`(3) 次仍失败 → **502** |
 | 其他非 2xx | 原样透传 |
 | 网络失败 / 超时 | `502` |
 | 无痕验证求解失败（拿不到参数） | `502` |
+| 无本地凭据 | `503` + `configuration_error` |
 
 ### 连接生命周期
 
-- 客户端断开（`res` 的 `close` 且未 `writableEnded`）→ `AbortController.abort()` 取消上游请求
+- 客户端断开（请求 `signal` abort）→ 取消上游请求，返回 499
 - 上游流读取中断 → 关闭响应，不抛穿
 
 ## 输入 / 输出
 
-- **输入**：Anthropic Messages 请求体 + 凭证头
+- **输入**：Anthropic Messages 请求体；凭据来自进程内 `settings`
 - **输出**：`text/event-stream` 字节流（透传），或 `application/json` 单条 message（聚合），或 Anthropic 形态错误体
 
 ## 约束
 
 - 不做任何协议转换（router 的 IR 层负责）
-- 不改写凭证级错误的状态码（那会破坏 router 的密钥轮换）
-- 不在插件内选择用哪一把密钥（router 的职责）
+- 不改写凭证级错误的状态码（那会破坏 router 对供应商的健康判断）
+- 不把占位符 `xrl-router` 发给上游
+- 不做完整密钥池：只做有序尝试 + 粘性成功 key，健康度/轮换仍由 router 的 provider 级策略兜底
 
 ## 边界条件
 
@@ -76,12 +95,13 @@
 
 ## 验收标准
 
-- [x] `pnpm e2e` 第 1 节：`/`、`/health` 结构、404、无凭证 401
+- [x] `pnpm e2e` 第 1 节：`/`、`/health` 结构、404、无本地凭据 503
 - [x] `pnpm e2e` 第 2 节：SSE 字节与上游逐帧一致；`stream` 被强制为 `true`
 - [x] `pnpm e2e` 第 3 节：非流式聚合出正确文本 / `stop_reason` / `usage`
 - [x] `pnpm e2e` 第 4 节：`glm-5.2` / `zai/GLM-5-Turbo` / `glm-5-turbo` 三种写法都归一化正确
-- [x] `pnpm e2e` 第 5 节：JWT 与 API Key 各自走对端点、带对头
+- [x] `pnpm e2e` 第 5 节：JWT 走 Coding Plan 端点、带对头；入站占位符从未发往上游
 - [x] `pnpm e2e` 第 7 节：402 / 429 / 401 原样透传；验证码持续失败返回 502；失效一次能自愈
+- [x] `pnpm e2e` 第 8 节：JWT 401 时自动换到下一把 API Key 并成功；默认站点走 BigModel、`zai` 站点走国际站
 
 ## 完成定义
 

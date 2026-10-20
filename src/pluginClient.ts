@@ -1,60 +1,24 @@
 /**
- * pluginClient.ts — 连接 xrl-router 的 WebSocket 客户端。
+ * pluginClient.ts — 连接 xrl-router 的 WebSocket 客户端（V24 契约）。
  *
  * 协议见 xrl-router `docs/specs/module-plugin-system.md`：
- *   插件 → Router：register / heartbeat / keys_update
- *   Router → 插件：registered / reconnected / error（本插件只记日志）
+ *   插件 → Router：register / heartbeat
+ *   Router → 插件：registered / reconnected / error / deleted
+ *
+ * V24 要点：
+ * - register **不能带 keys**（带了 router 直接拒绝并断开）
+ * - 心跳只发 `{"type":"heartbeat"}`，router 自己打时间戳
+ * - 凭证由插件自持，不再有 keys_update
  *
  * 生命周期：启动即连接 → 注册（首次落 pending，用户确认后转 active）→
- * 每 30s 心跳 → 每 5s 轮询 `.env` 检测密钥变化并推送 → 断线指数退避重连。
+ * 每 30s 心跳 → 断线指数退避重连。
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-
-import dotenv from 'dotenv';
 import { WebSocket } from 'ws';
 
-import {
-  KEYS_ENV_KEY,
-  PLUGIN_ID,
-  PROVIDER_API_PATH,
-  PROVIDER_KIND,
-  settings,
-} from './config';
-
-/**
- * 读密钥列表（逗号分隔）。
- *
- * 以 `.env` 文件为权威来源（5s 轮询就是靠它发现变更），文件里没写时回退到
- * 进程环境变量——方便容器 / CI 直接注入 `ZCODE_KEYS`。
- */
-export function readKeysFromEnv(cwd: string = process.cwd()): string[] {
-  let raw = '';
-  try {
-    const envPath = path.resolve(cwd, '.env');
-    if (fs.existsSync(envPath)) {
-      const parsed = dotenv.parse(fs.readFileSync(envPath, 'utf-8'));
-      raw = parsed[KEYS_ENV_KEY] ?? '';
-    }
-  } catch {
-    /* 读不到就靠环境变量兜底 */
-  }
-  if (!raw) raw = process.env[KEYS_ENV_KEY] || '';
-
-  return raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-function sameKeys(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((k, i) => k === b[i]);
-}
+import { PLUGIN_ID, PROVIDER_API_PATH, PROVIDER_KIND, settings } from './config';
 
 export interface PluginClientOptions {
-  /** `.env` 所在目录，默认 process.cwd() */
-  cwd?: string;
   /** 注入给 e2e 用：观察到 Router 发来的消息 */
   onMessage?: (msg: any) => void;
 }
@@ -62,25 +26,19 @@ export interface PluginClientOptions {
 export class PluginClient {
   private ws: WebSocket | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
-  private envPollTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
 
   private reconnectAttempts = 0;
   private connected = false;
 
-  private lastKeys: string[] = [];
-  private readonly cwd: string;
   private readonly onMessage?: (msg: any) => void;
 
   /** 供 e2e 断言 */
   public readonly sentMessages: any[] = [];
 
   constructor(options: PluginClientOptions = {}) {
-    this.cwd = options.cwd ?? process.cwd();
     this.onMessage = options.onMessage;
-    this.lastKeys = readKeysFromEnv(this.cwd);
     this.connect();
-    this.startEnvPolling();
   }
 
   private get wsUrl(): string {
@@ -117,7 +75,7 @@ export class PluginClient {
     });
   }
 
-  /** 构造并发送注册消息 */
+  /** 构造注册消息（V24：无 keys，带 workdir） */
   buildRegisterMessage(): Record<string, unknown> {
     return {
       type: 'register',
@@ -134,7 +92,7 @@ export class PluginClient {
         display_name: m.displayName,
         tier: 'custom',
       })),
-      keys: this.lastKeys,
+      workdir: process.cwd(),
     };
   }
 
@@ -162,6 +120,9 @@ export class PluginClient {
       case 'reconnected':
         console.log(`[plugin] 已重连既有 provider ${msg.provider_id}`);
         break;
+      case 'deleted':
+        console.warn('[plugin] 插件记录已被 xrl-router 删除，重连后将重新注册');
+        break;
       case 'error':
         console.error(`[plugin] xrl-router 返回错误：${msg.reason ?? JSON.stringify(msg)}`);
         break;
@@ -180,7 +141,7 @@ export class PluginClient {
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      this.send({ type: 'heartbeat', timestamp: Date.now() });
+      this.send({ type: 'heartbeat' });
     }, settings.heartbeatIntervalMs);
   }
 
@@ -204,26 +165,8 @@ export class PluginClient {
     }, delay);
   }
 
-  private startEnvPolling(): void {
-    this.envPollTimer = setInterval(() => this.checkEnvChanges(), settings.envPollIntervalMs);
-  }
-
-  /** 检测 `.env` 中密钥列表变化并推送（router 端做增删 diff，不会重复登记） */
-  private checkEnvChanges(): void {
-    const current = readKeysFromEnv(this.cwd);
-    if (sameKeys(current, this.lastKeys)) return;
-
-    this.lastKeys = current;
-    console.log(`[plugin] 检测到 ${KEYS_ENV_KEY} 变化（${current.length} 项），同步给 xrl-router`);
-    if (this.connected) this.send({ type: 'keys_update', keys: current });
-  }
-
   close(): void {
     this.stopHeartbeat();
-    if (this.envPollTimer) {
-      clearInterval(this.envPollTimer);
-      this.envPollTimer = null;
-    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

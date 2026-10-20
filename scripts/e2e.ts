@@ -17,6 +17,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
+import { serve } from '@hono/node-server';
 import { WebSocketServer } from 'ws';
 
 // ── 断言工具 ────────────────────────────────────────────────────────────────
@@ -158,6 +159,10 @@ async function startMockUpstream(): Promise<MockUpstream> {
       if (scenario === '402') return fail(402, 'insufficient quota');
       if (scenario === '429') return fail(429, 'rate limit exceeded');
       if (scenario === '401') return fail(401, 'invalid api key');
+      // 只让 JWT 失败，用于验证插件会顺延到下一把 API Key
+      if (scenario === 'jwt401' && String(req.headers.authorization || '').startsWith('Bearer ')) {
+        return fail(401, 'invalid jwt');
+      }
       if (scenario === 'captcha403') return fail(403, 'captcha verify failed');
       // 真实上游形态：HTTP 400 + {"code":3007,"msg":"captcha verify failed"}（见 reverse 6.6）
       if (scenario === 'captcha400') {
@@ -228,6 +233,15 @@ async function startMockRouter(): Promise<MockRouter> {
         return;
       }
       messages.push(msg);
+
+      // 复刻 V24 router：register 带 keys 即回错并断开
+      if (msg.type === 'register' && Object.prototype.hasOwnProperty.call(msg, 'keys')) {
+        messages.push({ type: 'error', reason: 'keys_not_supported' });
+        socket.send(JSON.stringify({ type: 'error', reason: 'keys_not_supported' }));
+        socket.close();
+        return;
+      }
+
       for (let i = waiters.length - 1; i >= 0; i--) {
         if (waiters[i].type === msg.type) {
           waiters[i].resolve(msg);
@@ -265,19 +279,26 @@ async function startMockRouter(): Promise<MockRouter> {
   };
 }
 
-// ── Mock api.z.ai（兑换链：z/login → getCustomerInfo → api_keys → copy）──────
+// ── Mock 兑换业务端（国内站 3 步 / 国际站 4 步）──────────────────────────────
 
 interface MockZaiApi {
   port: number;
   hits: string[];
+  /** 与 hits 一一对应的 Authorization 头（验证国内站直接用 access_token） */
+  auths: string[];
   close: () => Promise<void>;
 }
 
 const EXCHANGED_KEY_ID = 'mockkeyid123';
 const EXCHANGED_SECRET = 'mocksecret456';
+/** 国际站经过 z/login 换来的业务 token */
+const ZAI_BIZ_TOKEN = 'Bearer mock-biz-token';
+/** 国内站：OAuth access_token 直接作为业务 token */
+const BIGMODEL_OAUTH_TOKEN = 'Bearer mock-oauth-access-token';
 
 async function startMockZaiApi(): Promise<MockZaiApi> {
   const hits: string[] = [];
+  const auths: string[] = [];
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => {
@@ -286,23 +307,27 @@ async function startMockZaiApi(): Promise<MockZaiApi> {
     req.on('end', () => {
       const url = req.url || '';
       hits.push(`${req.method} ${url}`);
+      auths.push(String(req.headers.authorization ?? ''));
+      const auth = String(req.headers.authorization ?? '');
+      const bizAuthOk = auth === ZAI_BIZ_TOKEN || auth === BIGMODEL_OAUTH_TOKEN;
       const json = (data: any): void => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ code: 0, msg: '', data, success: true }));
       };
+      const unauthorized = (): void => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ code: 401, msg: 'token expired or incorrect', success: false }));
+      };
 
-      // 1. OAuth access_token → biz token
+      // 仅国际站：OAuth access_token → biz token
       if (url === '/api/auth/z/login') {
         const body = JSON.parse(raw || '{}');
         if (body.token !== 'mock-oauth-access-token') return json(null);
         return json({ access_token: 'mock-biz-token' });
       }
-      // 2. getCustomerInfo → 默认机构/项目（需 biz token）
+      // getCustomerInfo → 默认机构/项目
       if (url === '/api/biz/customer/getCustomerInfo') {
-        if (req.headers.authorization !== 'Bearer mock-biz-token') {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          return res.end(JSON.stringify({ code: 401, msg: 'token expired or incorrect', success: false }));
-        }
+        if (!bizAuthOk) return unauthorized();
         return json({
           organizations: [
             { organizationId: 'org-1', organizationName: '我的默认机构', projects: [
@@ -315,10 +340,7 @@ async function startMockZaiApi(): Promise<MockZaiApi> {
       // 3/4. api_keys 列表 / 创建 / copy
       const keysMatch = url.match(/^\/api\/biz\/v1\/organization\/org-1\/projects\/proj-1\/api_keys(\/copy\/(.+))?$/);
       if (keysMatch) {
-        if (req.headers.authorization !== 'Bearer mock-biz-token') {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          return res.end(JSON.stringify({ code: 401, msg: 'unauthorized', success: false }));
-        }
+        if (!bizAuthOk) return unauthorized();
         if (keysMatch[2]) {
           // copy/{apiKeyId} → secretKey
           if (decodeURIComponent(keysMatch[2]) !== EXCHANGED_KEY_ID) return json(null);
@@ -342,6 +364,7 @@ async function startMockZaiApi(): Promise<MockZaiApi> {
   return {
     port,
     hits,
+    auths,
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections?.();
@@ -355,6 +378,8 @@ async function startMockZaiApi(): Promise<MockZaiApi> {
 const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJtb2NrIn0.signature';
 const API_KEY = 'sk-mock-zai-api-key';
 const PLUGIN_PORT = 19165;
+/** V24：router 对插件恒发占位凭证 */
+const ROUTER_PLACEHOLDER = 'xrl-router';
 
 async function main(): Promise<void> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-e2e-'));
@@ -367,10 +392,14 @@ async function main(): Promise<void> {
 
   // ⚠ 必须在 require 插件模块之前设好——settings 在 import 时求值
   process.env.ZCODE_PORT = String(PLUGIN_PORT);
+  process.env.ZCODE_SITE = 'bigmodel';
   process.env.ZCODE_BASE_URL = `http://127.0.0.1:${upstream.port}/zcode-messages`;
-  process.env.ZAI_FALLBACK_URL = `http://127.0.0.1:${upstream.port}/fallback-messages`;
+  process.env.ZAI_FALLBACK_URL = `http://127.0.0.1:${upstream.port}/zai-messages`;
+  process.env.BIGMODEL_ANTHROPIC_URL = `http://127.0.0.1:${upstream.port}/bigmodel-messages`;
   process.env.ZCODE_CAPTCHA_CONFIG_URL = `http://127.0.0.1:${upstream.port}/configs`;
   process.env.ZAI_API_BASE = `http://127.0.0.1:${zaiApi.port}`;
+  process.env.BIGMODEL_API_BASE_URL = `http://127.0.0.1:${zaiApi.port}`;
+  process.env.BIGMODEL_OPEN_BASE_URL = `http://127.0.0.1:${zaiApi.port}`;
   process.env.ZCODE_SOLVER_PATH = path.join(__dirname, 'mock-solver.cjs');
   process.env.ZCODE_CAPTCHA_RETRIES = '1';
   process.env.ZCODE_CAPTCHA_CACHE_TTL = '60000';
@@ -378,29 +407,30 @@ async function main(): Promise<void> {
   process.env.ZCODE_KEYS = `${JWT},${API_KEY}`;
   process.env.XRL_ROUTER_URL = `http://127.0.0.1:${router.port}`;
   process.env.ZCODE_HEARTBEAT_INTERVAL_MS = '300';
-  process.env.ZCODE_ENV_POLL_INTERVAL_MS = '300';
   process.env.MOCK_SOLVER_COUNTER = counterFile;
 
   // 延迟加载：此刻 settings 才读到上面的值
   /* eslint-disable @typescript-eslint/no-var-requires */
   const { createApp } = require('../src/index') as typeof import('../src/index');
   const { PluginClient } = require('../src/pluginClient') as typeof import('../src/pluginClient');
+  const { isPortInUse } = require('../src/port') as typeof import('../src/port');
   const { fetchClientConfigs } = require('../src/zcode/configs') as typeof import('../src/zcode/configs');
   const { resolveCodingPlanApiKey } = require('../src/zcode/exchange') as typeof import('../src/zcode/exchange');
-  const { classifySecret } = require('../src/zcode/auth') as typeof import('../src/zcode/auth');
+  const { classifySecret, buildUpstreamRequest } = require('../src/zcode/auth') as typeof import('../src/zcode/auth');
 
   const app = createApp();
-  const server = await new Promise<http.Server>((resolve) => {
-    const s = app.listen(PLUGIN_PORT, '127.0.0.1', () => resolve(s));
+  const server = await new Promise<ReturnType<typeof serve>>((resolve) => {
+    const s = serve({ fetch: app.fetch, port: PLUGIN_PORT, hostname: '127.0.0.1' }, () => resolve(s));
   });
 
-  const pluginClient = new PluginClient({ cwd: tmpDir });
+  const pluginClient = new PluginClient();
   const base = `http://127.0.0.1:${PLUGIN_PORT}`;
 
+  // 所有入站请求都带 router 的占位凭证，模拟真实链路
   const post = (body: any, headers: Record<string, string> = {}): Promise<Response> =>
     fetch(`${base}/v1/messages`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': JWT, ...headers },
+      headers: { 'content-type': 'application/json', 'x-api-key': ROUTER_PLACEHOLDER, ...headers },
       body: JSON.stringify(body),
     });
 
@@ -418,6 +448,12 @@ async function main(): Promise<void> {
     check('GET /health 报 healthy + provider_kind=messages',
       health.status === 'healthy' && health.provider_kind === 'messages', JSON.stringify(health));
     check('GET /health 的 api_path 是 /v1/messages', health.api_path === '/v1/messages');
+    check('GET /health 标明 V24 契约与自持凭证数量',
+      health.contract === 'v24' && health.credentials_configured === 2, JSON.stringify(health));
+    check('默认站点是国内站 BigModel', health.site === 'bigmodel', String(health.site));
+    check('国内站默认的 API Key 上游是 open.bigmodel.cn 兼容端点',
+      health.api_key_upstream === `http://127.0.0.1:${upstream.port}/bigmodel-messages`,
+      String(health.api_key_upstream));
 
     const root = await (await fetch(`${base}/`)).json();
     check('GET / 暴露模型清单', Array.isArray(root.models) && root.models.length === 2,
@@ -426,12 +462,7 @@ async function main(): Promise<void> {
     const notFound = await fetch(`${base}/v1/models`);
     check('未实现的端点返回 404', notFound.status === 404);
 
-    const noSecret = await fetch(`${base}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: '{}',
-    });
-    check('无凭证时返回 401', noSecret.status === 401);
+    check('端口占用探测能识别正在监听的实例', (await isPortInUse(PLUGIN_PORT)) === true);
 
     // ── 2. 流式透传 ────────────────────────────────────────────────────────
     section('2. 流式透传（字节级）');
@@ -492,8 +523,8 @@ async function main(): Promise<void> {
     check('按展示名匹配 glm-5-turbo → 上游收到 GLM-5-Turbo',
       upstream.records[0]?.body.model === 'GLM-5-Turbo', upstream.records[0]?.body.model);
 
-    // ── 5. 凭证分流 ────────────────────────────────────────────────────────
-    section('5. 凭证分流（JWT vs API Key）');
+    // ── 5. 凭证自持与 JWT 分流 ─────────────────────────────────────────────
+    section('5. 凭证自持与 JWT 分流');
 
     upstream.records.length = 0;
     await post({ model: 'GLM-5.2', stream: false, max_tokens: 8, messages: [] });
@@ -501,6 +532,10 @@ async function main(): Promise<void> {
     check('JWT 走 Coding Plan 端点', jwtRec.url === '/zcode-messages', jwtRec.url);
     check('JWT 用 Authorization: Bearer', jwtRec.headers.authorization === `Bearer ${JWT}`,
       String(jwtRec.headers.authorization));
+    check('router 的占位凭证没有被转发给上游',
+      jwtRec.headers['x-api-key'] === undefined &&
+        !String(jwtRec.headers.authorization || '').includes(ROUTER_PLACEHOLDER),
+      `x-api-key=${String(jwtRec.headers['x-api-key'])} authorization=${String(jwtRec.headers.authorization)}`);
     check('JWT 带上无痕验证头', typeof jwtRec.headers['x-aliyun-captcha-verify-param'] === 'string',
       String(jwtRec.headers['x-aliyun-captcha-verify-param']));
     check('无痕验证头内容来自场景配置（透传到求解器）',
@@ -508,17 +543,6 @@ async function main(): Promise<void> {
       String(jwtRec.headers['x-aliyun-captcha-verify-param']));
     check('带上 anthropic-version', jwtRec.headers['anthropic-version'] === '2023-06-01');
     check('带上 ZCode 业务头', typeof jwtRec.headers['x-zcode-agent'] === 'string');
-
-    upstream.records.length = 0;
-    const apiKeyRes = await post(
-      { model: 'GLM-5.2', stream: false, max_tokens: 8, messages: [] },
-      { 'x-api-key': API_KEY },
-    );
-    const apiRec = upstream.records[0];
-    check('API Key 走回退端点', apiRec.url === '/fallback-messages', apiRec.url);
-    check('API Key 用 x-api-key 头', apiRec.headers['x-api-key'] === API_KEY);
-    check('API Key 不带无痕验证头', apiRec.headers['x-aliyun-captcha-verify-param'] === undefined);
-    check('API Key 请求成功', apiKeyRes.status === 200);
 
     // ── 6. 验证码缓存 ──────────────────────────────────────────────────────
     section('6. 验证码缓存');
@@ -538,7 +562,7 @@ async function main(): Promise<void> {
       `实际求解 ${solverCalls()} 次`);
 
     // ── 7. 错误码映射 ──────────────────────────────────────────────────────
-    section('7. 错误码映射（决定 router 是否轮换密钥）');
+    section('7. 错误码映射（多凭证耗尽后透传）');
 
     for (const [scenario, expected] of [
       ['402', 402],
@@ -546,7 +570,7 @@ async function main(): Promise<void> {
       ['401', 401],
     ] as const) {
       const res = await post({ model: 'GLM-5.2', mock_scenario: scenario, messages: [] });
-      check(`上游 ${scenario} → 插件原样透传 ${expected}`, res.status === expected, `实际 ${res.status}`);
+      check(`两把凭证都 ${scenario} → 插件透传 ${expected}`, res.status === expected, `实际 ${res.status}`);
     }
 
     const captchaAlways = await post({ model: 'GLM-5.2', mock_scenario: 'captcha403' });
@@ -563,8 +587,47 @@ async function main(): Promise<void> {
     check('验证码失效一次 → 刷新后重试成功（200）', captchaOnce.status === 200,
       `实际 ${captchaOnce.status}`);
 
-    // ── 8. 注册载荷与心跳 ──────────────────────────────────────────────────
-    section('8. 注册载荷与心跳');
+    // ── 8. 凭证故障转移（V24：router 不再轮换插件密钥）───────────────────────
+    section('8. 凭证故障转移');
+
+    upstream.records.length = 0;
+    const failoverRes = await post({
+      model: 'GLM-5.2',
+      mock_scenario: 'jwt401',
+      stream: false,
+      max_tokens: 8,
+      messages: [],
+    });
+    check('JWT 返回 401 → 自动顺延到下一把 API Key 并成功', failoverRes.status === 200,
+      `实际 ${failoverRes.status}`);
+    check('先尝试 Coding Plan 端点、再尝试国内站 BigModel 端点',
+      upstream.records.map((r) => r.url).join(',') === '/zcode-messages,/bigmodel-messages',
+      JSON.stringify(upstream.records.map((r) => r.url)));
+    const failoverRec = upstream.records[1];
+    check('API Key 走国内站 BigModel 端点', failoverRec?.url === '/bigmodel-messages', failoverRec?.url);
+    check('API Key 用 x-api-key 头', failoverRec?.headers['x-api-key'] === API_KEY,
+      String(failoverRec?.headers['x-api-key']));
+    check('API Key 不带无痕验证头',
+      failoverRec?.headers['x-aliyun-captcha-verify-param'] === undefined);
+    check('国内站 API Key 不带 ZCode 业务头',
+      failoverRec?.headers['x-zcode-agent'] === undefined &&
+        failoverRec?.headers['x-zcode-app-version'] === undefined);
+
+    // 同一份 API Key 在国际站要打 api.z.ai（且保留 ZCode 业务头）
+    const zaiApiKeyReq = buildUpstreamRequest(API_KEY, 'apiKey', null, 'zai');
+    check('ZCODE_SITE=zai 时 API Key 走国际站端点',
+      zaiApiKeyReq.url === `http://127.0.0.1:${upstream.port}/zai-messages`, zaiApiKeyReq.url);
+    check('国际站 API Key 保留 ZCode 业务头',
+      typeof zaiApiKeyReq.headers['x-zcode-agent'] === 'string');
+    check('占位凭证从未出现在任何上游请求里',
+      upstream.records.every(
+        (r) =>
+          r.headers['x-api-key'] !== ROUTER_PLACEHOLDER &&
+          !String(r.headers.authorization || '').includes(ROUTER_PLACEHOLDER),
+      ));
+
+    // ── 9. 注册载荷与心跳 ──────────────────────────────────────────────────
+    section('9. 注册载荷与心跳');
 
     const register = await router.waitFor('register');
     check('已向 xrl-router 发送 register', register !== null);
@@ -574,23 +637,31 @@ async function main(): Promise<void> {
     check('base_url 指向插件自身端口',
       register?.provider?.base_url === `http://localhost:${PLUGIN_PORT}`,
       String(register?.provider?.base_url));
+    check('register 不含 keys 字段（V24 严格拒绝）',
+      register !== null && !Object.prototype.hasOwnProperty.call(register, 'keys'),
+      JSON.stringify(register));
+    check('register 携带 workdir', typeof register?.workdir === 'string' && register.workdir.length > 0,
+      String(register?.workdir));
+    check('router 没有回 keys_not_supported',
+      router.messages.every((m) => m.type !== 'error'), JSON.stringify(router.messages.filter((m) => m.type === 'error')));
     check('models 数量与 ZCODE_MODELS 一致', register?.models?.length === 2,
       JSON.stringify(register?.models));
     check('models 保留上游大小写 + 自定义展示名',
       register?.models?.[0]?.model_id === 'GLM-5.2' && register?.models?.[0]?.display_name === 'glm-5.2',
       JSON.stringify(register?.models?.[0]));
-    check('keys 与 ZCODE_KEYS 一致',
-      JSON.stringify(register?.keys) === JSON.stringify([JWT, API_KEY]),
-      JSON.stringify(register?.keys));
 
     const hbBefore = router.messages.filter((m) => m.type === 'heartbeat').length;
     await sleep(1000);
     const hbAfter = router.messages.filter((m) => m.type === 'heartbeat').length;
     check('心跳按周期持续发送（1s 内 ≥2 次）', hbAfter - hbBefore >= 2,
       `实际 ${hbAfter - hbBefore} 次`);
+    const lastHb = [...router.messages].reverse().find((m) => m.type === 'heartbeat');
+    check('心跳载荷只有 type（V24 不上报 timestamp）',
+      lastHb !== undefined && Object.keys(lastHb).length === 1,
+      JSON.stringify(lastHb));
 
-    // ── 9. 上游配置接口（验证码场景 + 模型自动发现）──────────────────────────
-    section('9. 上游 configs 接口');
+    // ── 10. 上游配置接口（验证码场景 + 模型自动发现）─────────────────────────
+    section('10. 上游 configs 接口');
 
     check('请求 configs 接口时不携带任何查询参数',
       upstream.configUrls.length > 0 && upstream.configUrls.every((u) => !u.includes('?')),
@@ -610,24 +681,48 @@ async function main(): Promise<void> {
     check('configs 结果被缓存（不重复请求上游）',
       upstream.configUrls.length === 1, `实际请求 ${upstream.configUrls.length} 次`);
 
-    // ── 10. 兑换链：OAuth access_token → api.z.ai API Key（免验证码路线）──────
-    section('10. 兑换链（绕开无痕验证的官方路线）');
+    // ── 11. 兑换链：OAuth access_token → 免验证码 API Key（双站点）──────────
+    section('11. 兑换链（国内站 3 步 / 国际站 4 步）');
 
+    // 默认 = 国内站：access_token 直接作 Bearer，没有 z/login
     zaiApi.hits.length = 0;
-    const exchanged = await resolveCodingPlanApiKey('mock-oauth-access-token');
-    check('兑换出 apiKeyId.secretKey 形态的密钥',
-      exchanged.apiKey === `${EXCHANGED_KEY_ID}.${EXCHANGED_SECRET}`, exchanged.apiKey);
-    check('兑换结果被 classifySecret 判为 apiKey（→ 走 api.z.ai 免验证码分支）',
-      classifySecret(exchanged.apiKey) === 'apiKey', classifySecret(exchanged.apiKey));
+    zaiApi.auths.length = 0;
+    const bmExchanged = await resolveCodingPlanApiKey('mock-oauth-access-token');
+    check('国内站兑换出 apiKeyId.secretKey 形态的密钥',
+      bmExchanged.apiKey === `${EXCHANGED_KEY_ID}.${EXCHANGED_SECRET}`, bmExchanged.apiKey);
+    check('兑换结果被 classifySecret 判为 apiKey（→ 走免验证码分支）',
+      classifySecret(bmExchanged.apiKey) === 'apiKey', classifySecret(bmExchanged.apiKey));
     check('命中默认机构/默认项目',
-      exchanged.organizationName === '我的默认机构' && exchanged.projectName === '默认项目',
-      `${exchanged.organizationName} / ${exchanged.projectName}`);
-    check('按官方链路顺序调了 4 个端点',
-      zaiApi.hits[0] === 'POST /api/auth/z/login' &&
+      bmExchanged.organizationName === '我的默认机构' && bmExchanged.projectName === '默认项目',
+      `${bmExchanged.organizationName} / ${bmExchanged.projectName}`);
+    check('国内站按 3 步链路兑换（无 z/login）',
+      zaiApi.hits.length === 3 &&
+        zaiApi.hits[0] === 'GET /api/biz/customer/getCustomerInfo' &&
+        zaiApi.hits[1].includes('/api_keys') &&
+        zaiApi.hits[2].includes('/copy/'),
+      JSON.stringify(zaiApi.hits));
+    check('国内站直接拿 OAuth access_token 当业务 Bearer',
+      zaiApi.auths.every((a) => a === BIGMODEL_OAUTH_TOKEN), JSON.stringify(zaiApi.auths));
+
+    // 显式国际站：先 z/login 换 biz token，再走同样的三步
+    zaiApi.hits.length = 0;
+    zaiApi.auths.length = 0;
+    const zaiExchanged = await resolveCodingPlanApiKey('mock-oauth-access-token', {
+      site: 'zai',
+      zaiApiBase: `http://127.0.0.1:${zaiApi.port}`,
+    });
+    check('国际站兑换出同样的 apiKeyId.secretKey',
+      zaiExchanged.apiKey === `${EXCHANGED_KEY_ID}.${EXCHANGED_SECRET}`, zaiExchanged.apiKey);
+    check('国际站按 4 步链路兑换（z/login 先行）',
+      zaiApi.hits.length === 4 &&
+        zaiApi.hits[0] === 'POST /api/auth/z/login' &&
         zaiApi.hits[1] === 'GET /api/biz/customer/getCustomerInfo' &&
         zaiApi.hits[2].includes('/api_keys') &&
         zaiApi.hits[3].includes('/copy/'),
       JSON.stringify(zaiApi.hits));
+    check('国际站业务请求用 z/login 换来的 biz token',
+      zaiApi.auths[0] === '' && zaiApi.auths.slice(1).every((a) => a === ZAI_BIZ_TOKEN),
+      JSON.stringify(zaiApi.auths));
 
     // 兑换失败要抛错（login.ts 依赖此行为回退到存 JWT）
     let threw = false;
@@ -641,10 +736,8 @@ async function main(): Promise<void> {
     pluginClient.close();
   } finally {
     await new Promise<void>((resolve) => {
-      server.closeAllConnections?.();
       server.close(() => resolve());
-    });
-    await upstream.close();
+    });    await upstream.close();
     await router.close();
     await zaiApi.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

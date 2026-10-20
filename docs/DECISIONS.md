@@ -48,6 +48,10 @@
 
 **代价**：若某个上游真的用「403 + 含 verify 字样」表达凭证失效，会被我们误判为验证码问题，重试 3 次后返回 502，router 不标红而只是重试。这个方向上我们**刻意偏向「不误伤好密钥」**。
 
+> **V24 补注（2026-10）**：router 已不再为插件管理密钥，也不会因插件返回 401/403 去标红任何东西。
+> 但「错误码如实透传」仍然保留，因为 router 的 provider 级 failover / 冷却依赖 5xx 与 4xx 的区分；
+> 验证码失败继续映射 502，避免一次求解抖动被当成 provider 故障。
+
 **何时重新审视**：若观测到 ZCode 的凭证失效错误体里确实带 captcha/verify 字样。
 
 ---
@@ -137,6 +141,10 @@ ZCODE_MODELS=GLM-5.2=glm-5.2,GLM-5-Turbo
 
 **边界**：`ZCODE_KEYS` 支持多个逗号分隔凭证，但插件**只是把它们推给 router**，自己从不选择用哪一把。
 
+> **V24 补注（2026-10）**：router 已把手伸回去了——V24 起插件密钥由插件自持，register 带 `keys` 会被
+> 直接拒绝。本条关于「插件不建完整密钥池」的结论仍成立，但「推给 router / 自己从不选择」已过时，
+> 见 D-11。
+
 ---
 
 ## D-7: 为什么密钥的权威来源是 `.env` 文件，而不是进程环境变量？
@@ -147,10 +155,14 @@ ZCODE_MODELS=GLM-5.2=glm-5.2,GLM-5-Turbo
 
 **原因**：
 
-- **可热更新**：进程环境变量在启动后无法改变，改密钥必须重启插件。`.env` 轮询让 `pnpm login` 写完就能立刻生效
+- **可热更新**：进程环境变量在启动后无法改变，改密钥必须重启插件。`.env` 轮询让 `pnpm run login` 写完就能立刻生效
 - **与环境变量不冲突**：回退分支保证容器 / CI 里直接注入 `ZCODE_KEYS` 也能工作
 
 **没选 `fs.watch`**：跨平台行为不一致（inotify vs FSEvents vs ReadDirectoryChangesW），且需要额外处理编辑器写文件的中间态。5s 轮询的开销是「每 5 秒读一个 <1KB 文件」，与 qwenwork 的项目决策一致。
+
+> **V24 补注（2026-10）**：5s 轮询与 `keys_update` 已随 V24 一起删除（router 收到 `keys_update`
+> 会直接断开）。`.env` 仍是唯一权威来源，但改动只在进程启动时读取——`pnpm run login` 之后需要重启插件。
+> 用可接受的一次重启换取「不用维护两条密钥同步通道」，见 D-11。
 
 ---
 
@@ -203,6 +215,11 @@ ZCODE_MODELS 显式配置  >  启动时从 client/configs 的 builtinModels 自�
 或若上游 `builtinProviders` 里 `builtin:zai-coding-plan`（`baseUrl: https://api.z.ai/api/anthropic`）
 那条「套餐凭证走 api.z.ai、无需验证码」的路线被证实可行 → 直接删掉整个求解器。
 
+> **后续实测补注（2026-09-22）**：F001 已被「硬化指纹桩 + 每次求解间隔 ≥10–15s」突破
+> （4/5 次成功）。当前阻塞已变为 ESA WAF 的**账号/IP 维度** `3012 unusual activity`，
+> 与 jsdom 指纹无关。见 `docs/reverse/ZCODE_REVERSE.md` 6.7。结论不变：优先路线 A，
+> 不要在指纹桩上继续无边界试错。
+
 ---
 
 ## D-10: 改走「OAuth 兑换 API Key」官方路线，绕开无痕验证（承接 D-9 的出路）
@@ -230,13 +247,13 @@ POST api.z.ai/api/anthropic/v1/messages   x-api-key: apiKeyId.secretKey   ★ �
 
 **决定性事实**：
 
-1. 官方对 Coding Plan 额度走的是 **api.z.ai**，不是 zcode-plan + 无痕验证。`builtinProviders`
+1. 官方（国际站）对 Coding Plan 额度走的是 **api.z.ai**，不是 zcode-plan + 无痕验证。`builtinProviders`
    里 `builtin:zai-coding-plan` 的 `baseUrl` 正是 `https://api.z.ai/api/anthropic`，闭环。
 2. 无痕验证（`X-Aliyun-Captcha-Verify-Param`）在 bundle 里只绑定 `{plan_id}` 的**套餐激活**请求，
    以及 zcode-plan provider 的可选 runtime headers——**不在推理主路径**。
 3. 兑换链 4 个端点用假 token 实测**全部存活**（z/login→`code:500`、getCustomerInfo→`code:1001`/`401`）。
 
-**决策**：`pnpm login` 默认走兑换链，把 OAuth `access_token` 换成 `apiKeyId.secretKey` 存进
+**决策**：`pnpm run login` 默认走兑换链，把 OAuth `access_token` 换成 `apiKeyId.secretKey` 存进
 `.env`。转发层**无需改动**——`classifySecret` 早已把「非三段点分」判为 apiKey，自动走
 `ZAI_FALLBACK_URL`（api.z.ai）免验证码分支。兑换失败时回退存 JWT（路线 B）并告警。
 
@@ -257,3 +274,108 @@ POST api.z.ai/api/anthropic/v1/messages   x-api-key: apiKeyId.secretKey   ★ �
 
 **何时重新审视**：真实账号验证后，若确认兑换 key 走的不是订阅额度 → 退回 D-9 的路线 B 攻坚；
 若确认是订阅额度 → 可考虑把求解器与 zcode-plan 分支整体降级为可选/删除。
+
+> **后续补注（2026-10-20）**：默认站点已改为国内站 BigModel。D-10 描述的是国际站 Z.AI 的
+> 4 步兑换链；国内站是 3 步（access_token 直接作 Bearer），见 D-12。
+
+---
+
+## D-11: 迁移到 xrl-router V24 插件契约 —— 凭证改由插件自持
+
+**背景**：插件初版是照 qwenwork 旧架构做的：Express + 注册时把 `ZCODE_KEYS` 作为 `keys` 推给
+router、每 5s 轮询 `.env` 发 `keys_update`、请求时从入站 `x-api-key` 取真实凭证。之后 router
+升级到 **V24**：插件密钥职责整体剥离给插件方，register 带 `keys` 会被**严格拒绝并断开**，
+router 对插件请求恒发占位凭证 `xrl-router`。照旧跑的结果是每一条推理请求都拿 `xrl-router`
+去打上游，必然 401。
+
+**决策**：按 V24 契约重写接入层。
+
+1. **HTTP 框架 Express → Hono**（`@hono/node-server`），SSE 直接返回 Web `ReadableStream`。
+2. **register 去掉 `keys`，增加 `workdir`**；删除 `keys_update` 与 `.env` 轮询。
+3. **凭证由插件自持**：启动时读 `.env` 的 `ZCODE_KEYS`，请求时按顺序尝试；成功的一把记住，
+   401/402/403/429 顺延下一把，全部失败后透传最后一个状态码。
+4. **入站凭证一律忽略**（包括 router 的占位值），不再从请求头取 key。
+5. **端口幂等**：端口被占用时 `exit 0`，不再 taskkill/lsof 杀掉占用者。
+
+**为什么不照抄 qwenwork 的端口处理**：qwenwork 仍保留「启动前杀占用者」的旧做法，与 V24
+`serve` 幂等契约冲突；router 的伴生启动会先做 TCP 探测，杀进程反而可能打断用户手动启动的实例。
+
+**为什么保留最小故障转移**：V24 把密钥管理整体推给插件后，`ZCODE_KEYS` 的多凭证语义若只取第一把，
+等于悄悄丢弃其余配置。顺序顺延 + 成功粘滞是能维持「多账号可用」的最小子集，不引入健康度表、
+额度监控或后台 UI。
+
+**代价**：
+
+- `.env` 改动不再热生效——`pnpm run login` 后需重启插件（router 伴生启动会负责重启）
+- 多凭证只有请求级顺延，没有冷却、配额耗尽换号等策略
+- 验证码失败不做跨凭证顺延：无痕验证是账号维度问题，换 key 往往只是多烧一次求解
+
+**何时重新审视**：若 router 重新把插件密钥纳入密钥池（当前无此计划），或真实账号证明
+验证码失败换账号能稳定自愈。
+
+---
+
+## D-12: 默认站点改为国内站 BigModel —— 国内用户优先
+
+**背景**：明确要求「务必优先服务国内用户，登录站点必须是中国站」。初版默认走国际站
+Z.AI（授权 `chat.z.ai`、推理 `api.z.ai`），对中国大陆用户不友好；智谱的国内官方入口是
+BigModel（`bigmodel.cn` / `open.bigmodel.cn`）。
+
+**证据（2026-10-20 实测 + 本机 bundle 逆向）**：
+
+1. `POST https://zcode.z.ai/api/v1/oauth/cli/init`（Bearer poll token）按 body 里的
+   `provider` 返回不同授权页：
+   - `{"provider":"bigmodel"}` → `https://bigmodel.cn/login?appId=zcode&redirect=https://zcode.z.ai/api/v1/oauth/cli/callback/bigmodel&state=…`
+   - `{"provider":"zai"}` → `chat.z.ai`
+2. OAuth ready 载荷按 provider 分键：`data.bigmodel.access_token` / `data.zai.access_token`，
+   另有 `data.token`（Coding Plan JWT）。
+3. 官方 bundle 的 `resolveCodingPlanApiKey` 按 provider 分支：国际站先
+   `POST api.z.ai/api/auth/z/login` 换 biz token；**国内站直接把 OAuth `access_token` 作为
+   业务凭证打 `bigmodel.cn/api/biz/*`**，没有 z/login。
+   注：本机 3.5.3 bundle 已改用 `/api_keys/{id}/access_tokens` 换**短时项目 token**；
+   旧链路的 `/api_keys/copy/{id}`（返回长期 `secretKey`）在两个站点仍存活（假 token → 401）。
+   本插件采用 `copy`，因为它能产出适合静态 `.env` 的长期密钥，而项目 token 需要运行时刷新。
+4. `GET https://bigmodel.cn/api/biz/customer/getCustomerInfo` 用假 token → `401 token expired or incorrect`（端点存活，鉴权语义与 Z.AI 一致）。
+5. `client/configs` 的 `builtinProviders` 含 `builtin:bigmodel-coding-plan`，`baseUrl` 为
+   `https://open.bigmodel.cn/api/anthropic`；假 key 打 `/api/anthropic/v1/messages` → `401`。
+6. `https://open.bigmodel.cn/api/paas/v4/models` 假 key → `401`，与
+   `api.z.ai/api/paas/v4/models` 行为一致，可作探活端点。
+7. 当前 bundle 对 BigModel 的 `getCustomerInfo` / `api_keys` 发**裸** `Authorization`
+   （不带 `Bearer`），对 Z.AI 的 `api_keys` 才发 `Bearer`。实测两种前缀在 BigModel 上都返回
+   同样的 `401 令牌已过期或验证不正确`，无法用假 token 区分；本插件统一用 `Bearer`，
+   这一差异留待真实账号验证（见逆向文档第 7 节）。
+
+**决策**：
+
+- `ZCODE_SITE` 默认 `bigmodel`；`login` 的 init body 用该值，ready 取 `data[site].access_token`。
+- 国内站兑换走 3 步，`access_token` 直接作 Bearer，base = `BIGMODEL_API_BASE_URL`
+  （默认 `https://bigmodel.cn`）。
+- 国内站 API Key 推理走 `BIGMODEL_ANTHROPIC_URL`
+  （默认 `https://open.bigmodel.cn/api/anthropic/v1/messages`），只带 `x-api-key`，
+  **不带** ZCode 身份头（标准 Anthropic 兼容端点）。
+- 国内站探活走 `open.bigmodel.cn/api/paas/v4/models`。
+- `ZCODE_SITE=zai` 保留原国际站行为（4 步兑换 + `api.z.ai` + ZCode 身份头）。
+
+**为什么不做域名自动探测**：站点是账户归属问题，不能靠网络可达性猜；显式 `ZCODE_SITE`
+让凭证与站点一一对应，避免把国内站 access_token 误发到国际站。
+
+**代价**：多一组环境变量与分支；e2e 需同时覆盖 3 步与 4 步兑换链（已覆盖）。
+两个站点的 JWT 主端点仍共用 `zcode.z.ai`。
+
+**真实账号验证（2026-10-20）**：`pnpm run login` 在国内站完成 OAuth，`/copy` 链路成功
+产出 49 字符的 `apiKeyId.secretKey`；`pnpm capture-key` 探活
+`open.bigmodel.cn/api/paas/v4/models` → **200**；通过插件发真实推理请求，上游返回
+`429 code:1310「您已达到每周/每月使用上限」`（重置时间 **2026-10-22 11:23:27**），而非 401。
+
+这证明了两件事：
+
+1. **旧 `/copy` 兑换链在真实 BigModel 账号上仍然可用**——此前「新版 bundle 已改用
+   `/access_tokens`，旧端点是否还能产出长期 secretKey」的疑问已解决。
+2. **兑换 key 能通过 BigModel 鉴权，并受账户套餐额度约束**。额度耗尽返回的是套餐上限
+   而非 API 余额不足，这是「消耗订阅额度」的强证据；但正式扣减明细仍需对账。
+
+**仍未确证**：额度重置后的成功生成、以及额度扣减是否落在 Coding Plan 套餐上（需
+`billing/balance` 前后对比）。留待 2026-10-22 后复测。
+
+**何时重新审视**：若复测发现扣减走的是另计 API 余额，回到 D-10 的结论重新评估；
+若 BigModel 兑换链在真实账号上失效，可切回 `ZCODE_SITE=zai`，或依赖 `login` 的 JWT 兜底。

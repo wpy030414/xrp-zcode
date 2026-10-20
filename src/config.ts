@@ -44,8 +44,23 @@ const models: ModelSpec[] = modelsExplicit
   ? parseModelsConfig(modelsRaw)
   : parseModelsConfig(DEFAULT_MODELS);
 
-/** xrl-router 密钥池取 key 时用的 `.env` 变量名 */
+/** 凭证列表所在的 `.env` 变量名 */
 export const KEYS_ENV_KEY = 'ZCODE_KEYS';
+
+/** 站点选择：bigmodel = 国内站（智谱 BigModel），zai = 国际站（Z.AI） */
+export type ZcodeSite = 'bigmodel' | 'zai';
+export const SITE_ENV_KEY = 'ZCODE_SITE';
+
+function parseSite(raw: string): ZcodeSite {
+  return raw.trim().toLowerCase() === 'zai' ? 'zai' : 'bigmodel';
+}
+
+function parseKeyList(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
 export const PLUGIN_ID = 'xrl-router-plugin-zcode';
 
@@ -56,6 +71,15 @@ export const PROVIDER_API_PATH = '/v1/messages';
 export interface Settings {
   port: number;
   xrlRouterUrl: string;
+
+  /** 优先服务的站点：默认国内站 BigModel，国际站需显式 ZCODE_SITE=zai */
+  site: ZcodeSite;
+
+  /**
+   * 插件自持的凭证列表（V24 起 Router 不再管理插件密钥）。
+   * 请求时按顺序尝试，成功的一把会被记住，失败则顺延到下一把。
+   */
+  keys: string[];
 
   models: ModelSpec[];
   /** `ZCODE_MODELS` 是否被显式配置（未配置时启动会尝试从上游自动发现） */
@@ -69,6 +93,12 @@ export interface Settings {
   zaiFallbackUrl: string;
   /** Z.AI 平台业务根（兑换链 /api/auth/z/login、/api/biz/* 用；免验证码） */
   zaiApiBase: string;
+  /** BigModel 业务根（国内站兑换链 /api/biz/* 用） */
+  bigmodelApiBase: string;
+  /** BigModel 开放平台根（API Key 探活用） */
+  bigmodelOpenBase: string;
+  /** BigModel 的 Anthropic 兼容端点（国内站 API Key 推理用） */
+  bigmodelFallbackUrl: string;
   /** ZCode OAuth 根（/oauth/cli/init、/oauth/cli/poll 用） */
   oauthBase: string;
   /** 额度 / 计费查询基址（capture-key 用） */
@@ -101,7 +131,6 @@ export interface Settings {
 
   /** 插件 ↔ xrl-router 的 WebSocket 节奏（e2e 可缩短以便验证） */
   heartbeatIntervalMs: number;
-  envPollIntervalMs: number;
   reconnectBaseMs: number;
   reconnectMaxMs: number;
 }
@@ -109,6 +138,10 @@ export interface Settings {
 export const settings: Settings = {
   port: intEnv('ZCODE_PORT', 19065),
   xrlRouterUrl: env('XRL_ROUTER_URL', 'http://localhost:19068'),
+
+  site: parseSite(env(SITE_ENV_KEY, 'bigmodel')),
+
+  keys: parseKeyList(env(KEYS_ENV_KEY, '')),
 
   models,
   modelsExplicit,
@@ -120,6 +153,12 @@ export const settings: Settings = {
   ),
   zaiFallbackUrl: env('ZAI_FALLBACK_URL', 'https://api.z.ai/api/anthropic/v1/messages'),
   zaiApiBase: env('ZAI_API_BASE', 'https://api.z.ai'),
+  bigmodelApiBase: env('BIGMODEL_API_BASE_URL', 'https://bigmodel.cn'),
+  bigmodelOpenBase: env('BIGMODEL_OPEN_BASE_URL', 'https://open.bigmodel.cn'),
+  bigmodelFallbackUrl: env(
+    'BIGMODEL_ANTHROPIC_URL',
+    'https://open.bigmodel.cn/api/anthropic/v1/messages',
+  ),
   oauthBase: env('ZCODE_OAUTH_BASE', 'https://zcode.z.ai/api/v1'),
   billingBase: env('ZCODE_BILLING_BASE', 'https://zcode.z.ai/api/v1/zcode-plan'),
   captchaConfigUrl: env('ZCODE_CAPTCHA_CONFIG_URL', 'https://zcode.z.ai/api/v1/client/configs'),
@@ -144,7 +183,6 @@ export const settings: Settings = {
   },
 
   heartbeatIntervalMs: intEnv('ZCODE_HEARTBEAT_INTERVAL_MS', 30_000),
-  envPollIntervalMs: intEnv('ZCODE_ENV_POLL_INTERVAL_MS', 5_000),
   reconnectBaseMs: intEnv('ZCODE_RECONNECT_BASE_MS', 1_000),
   reconnectMaxMs: intEnv('ZCODE_RECONNECT_MAX_MS', 60_000),
 };
