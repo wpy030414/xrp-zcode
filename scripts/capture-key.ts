@@ -142,7 +142,7 @@ async function probeJwt(jwt: string): Promise<ProbeOutcome> {
 }
 
 async function main(): Promise<void> {
-  console.log('🔑 xrl-router-plugin · zcode 凭证体检\n');
+  console.log('🔑 xrp-zcode · 凭证体检\n');
 
   const fromFile = readEnvFileValue(KEYS_ENV_KEY);
   const raw = fromFile || process.env[KEYS_ENV_KEY] || '';

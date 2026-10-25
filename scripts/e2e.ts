@@ -631,7 +631,7 @@ async function main(): Promise<void> {
 
     const register = await router.waitFor('register');
     check('已向 xrl-router 发送 register', register !== null);
-    check('plugin_id 正确', register?.plugin_id === 'xrl-router-plugin-zcode', String(register?.plugin_id));
+    check('plugin_id 正确', register?.plugin_id === 'plugin-zcode', String(register?.plugin_id));
     check('provider.kind = messages', register?.provider?.kind === 'messages', String(register?.provider?.kind));
     check('provider.api_path = /v1/messages', register?.provider?.api_path === '/v1/messages');
     check('base_url 指向插件自身端口',

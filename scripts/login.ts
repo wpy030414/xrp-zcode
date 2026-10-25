@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * scripts/login.ts — `pnpm run login`：OAuth 登录 → 兑换成免验证码的长期 API Key。
+ * scripts/login.ts — `pnpm run login`：自包含网页 OAuth 登录（唯一登录入口）
+ * → 兑换成免验证码的长期 API Key。
  *
  * 【默认国内站】ZCODE_SITE 默认 `bigmodel`：OAuth init 传 `provider:"bigmodel"`，
  * 服务端返回的授权页是 https://bigmodel.cn/login；兑换走 bigmodel.cn/api/biz/*，
@@ -24,7 +25,8 @@
  * 兜底：兑换失败时（例如账户无默认机构/项目），退回保存 JWT，并提示该形态需要
  * 无痕验证、当前可能不可用——保证 login 至少不丢凭证。
  *
- * 运行时零客户端依赖：全程纯 HTTP，不需要安装 ZCode 桌面端。
+ * 运行时零客户端依赖：全程纯 HTTP，不需要安装 ZCode 桌面端；也不读取 App 登录态、
+ * 本地数据库或凭证文件——登录只走本脚本的网页 OAuth（D-13）。
  */
 
 import { exec } from 'node:child_process';
@@ -102,7 +104,7 @@ function persistKey(secret: string, hint: string): void {
 async function main(): Promise<void> {
   const siteLabel =
     settings.site === 'bigmodel' ? '国内站 BigModel（open.bigmodel.cn）' : '国际站 Z.AI（api.z.ai）';
-  console.log(`🔑 xrl-router-plugin · zcode 登录（OAuth → 兑换免验证码 API Key）`);
+  console.log(`🔑 xrp-zcode · 自包含网页 OAuth 登录（浏览器授权 → 兑换免验证码 API Key）`);
   console.log(`   站点：${siteLabel}\n`);
 
   const pollToken = randomBytes(32).toString('hex');

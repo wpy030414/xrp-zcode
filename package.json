@@ -1,7 +1,7 @@
 {
   "version": "0.1.0",
-  "name": "xrl-router-plugin-zcode",
-  "description": "xrl-router 插件：把 ZCode (zcode.z.ai) 的免费额度包装成 OpenAI/Anthropic 兼容的本地服务",
+  "name": "xrp-zcode",
+  "description": "ZCode 通道的 xrl-router 插件：自包含网页 OAuth 登录 + Anthropic Messages 反代",
   "private": true,
   "scripts": {
     "serve": "tsx src/index.ts",

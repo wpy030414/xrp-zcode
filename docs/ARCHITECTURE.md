@@ -1,4 +1,4 @@
-# ARCHITECTURE — xrl-router-plugin-zcode
+# ARCHITECTURE — xrp-zcode
 
 ## 系统概述
 
@@ -15,7 +15,7 @@ xrl-router :19068
    │  HTTP POST http://localhost:19065/v1/messages
    │        头：x-api-key: xrl-router（占位，插件忽略）
    ▼
-xrl-router-plugin-zcode :19065
+xrp-zcode (plugin-zcode) :19065
    │  ├─ 从 .env 的 ZCODE_KEYS 取凭证（顺序故障转移）
    │  ├─ 判定凭证形态（三段点分 JWT / 其他）
    │  ├─ JWT → 取无痕验证参数（jsdom 子进程求解，TTL 缓存）
@@ -93,6 +93,19 @@ captchaManager.getVerifyParam()
                               → 写缓存
 ```
 
+### 登录链路（唯一入口）
+
+```
+pnpm run login
+  ├─ POST {ZCODE_OAUTH_BASE}/oauth/cli/init（Bearer 本地随机 poll token）
+  ├─ 浏览器授权（默认 bigmodel.cn；ZCODE_SITE=zai 时 chat.z.ai）
+  ├─ GET {ZCODE_OAUTH_BASE}/oauth/cli/poll/{flow_id} 轮询至 ready
+  ├─ resolveCodingPlanApiKey(access_token)：国内站 3 步 / 国际站 4 步
+  └─ 写入 .env 的 ZCODE_KEYS（优先 API Key；兑换失败回退 JWT）
+```
+
+这是本插件**唯一**的登录链路：不依赖 ZCode 桌面端，不读取 App 登录态、本地数据库或凭证文件。登录完成后，运行时只消费 `.env` 里由这次 OAuth 产出的凭证。
+
 ## 外部系统
 
 | 系统 | 用途 | 失败时的行为 |
@@ -100,7 +113,7 @@ captchaManager.getVerifyParam()
 | xrl-router `/ws/plugin` | 注册、心跳 | 指数退避重连（1s → 最大 60s）；本地转发不受影响 |
 | `zcode.z.ai` 推理端点 | JWT 形态的主上游 | 按上表映射 |
 | `open.bigmodel.cn` 推理端点 | 国内站 API Key 形态的默认上游（免验证码） | 按上表映射 |
-| `bigmodel.cn/api/biz/*` | 国内站 OAuth 兑换链（仅 `pnpm run login`） | 兑换失败 → 回退存 JWT 并告警 |
+| `bigmodel.cn/api/biz/*` | 国内站 OAuth 兑换链（仅 `pnpm run login`，唯一登录入口） | 兑换失败 → 回退存 JWT 并告警 |
 | `zcode.z.ai/api/v1/client/configs` | 拉验证码场景参数 | 回退内置默认值并负缓存 |
 | `zcode.z.ai/api/v1/zcode-plan/*` | 额度 / 套餐 / 用量查询 | 仅 `pnpm capture-key` 使用，失败只影响体检输出 |
 | `api.z.ai` 推理端点 | 国际站 API Key 形态的上游（`ZCODE_SITE=zai`） | 按上表映射 |
@@ -112,3 +125,4 @@ captchaManager.getVerifyParam()
 2. **V24 下凭证由插件自持。** Router 只发占位凭证，插件用 `.env` 的 `ZCODE_KEYS` 访问上游；多把凭证按顺序顺延，成功的一把粘滞。不建完整密钥池 / 健康度系统，见 D-11。
 3. **验证码求解在子进程。** jsdom 需要 `runScripts: 'dangerously'` 跑混淆 SDK，隔离出去才能超时强杀、崩溃不污染主进程，见 D-3。
 4. **上游一律按流式请求。** 非流式客户端由插件聚合，避免依赖上游的非流式行为是否可用，见 D-5。
+5. **登录只有自包含网页 OAuth 一条链路。** 唯一入口是 `pnpm run login`：浏览器授权 + 轮询取票 + 兑换 API Key；不依赖 ZCode 桌面端，不读取本地登录态。见 D-13。

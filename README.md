@@ -1,10 +1,13 @@
-# xrl-router-plugin-zcode
+# xrp-zcode
 
 把 ZCode（`zcode.z.ai`）的额度包装成 xrl-router 里一个普通可路由的供应商。
+
+**唯一登录方式为自包含网页 OAuth 登录**：`pnpm run login` 发起浏览器授权并轮询取票，本机不需要安装 ZCode 桌面端，也不读取任何本地登录态或凭证文件。
 
 ## 这是什么？
 
 - **定位**：xrl-router 的**委托供应商插件**（WebSocket 注册，见 xrl-router `docs/specs/module-plugin-system.md`）。
+- **登录方式唯一**：只走 ZCode 官方 OAuth 的网页授权链路（默认国内站 `bigmodel.cn`，国际站 `chat.z.ai`），登录入口只有 `pnpm run login`。
 - **解决的核心问题**：ZCode 的额度只能在其官方客户端里花掉——上游是私有 Anthropic Messages 端点，且要求阿里云「无痕验证」参数。本插件把这层私有性抹平，让 Claude Code / CCSwitch / 任意 OpenAI 兼容客户端都能用上这份额度。
 
 ```
@@ -27,7 +30,7 @@
 ```bash
 pnpm install
 
-# 1. 拿凭证（默认国内站 BigModel OAuth，浏览器授权）
+# 1. 登录（唯一入口：自包含网页 OAuth，默认国内站 BigModel）
 pnpm run login
 
 # 2. 体检：确认凭证可用并查看剩余额度
@@ -46,14 +49,16 @@ pnpm serve
 curl http://localhost:19065/health
 ```
 
-## 两条凭证路线
+## 一次登录，两种凭证形态
 
-ZCode 的 Coding Plan 额度有**两条**可用路线，本插件默认走免验证码的那条：
+登录只有一条链路：`pnpm run login` 的自包含网页 OAuth。OAuth 完成后，插件会把凭证兑换成两种形态之一——默认是免验证码的长期 API Key；只有兑换失败时才回退保存 JWT。这不是第二种登录方式，而是同一次登录的凭证回退。
 
-| 路线 | 凭证 | 端点 | 无痕验证 | 状态 |
+| 形态 | 凭证 | 端点 | 无痕验证 | 状态 |
 |------|------|------|:---:|------|
 | **A（默认）** OAuth 兑换 | `apiKeyId.secretKey`（长期 API Key） | 国内站 `open.bigmodel.cn/api/anthropic` / 国际站 `api.z.ai/api/anthropic` | ❌ 不需要 | ✅ 国内站真实账号已验证鉴权 |
 | **B（兜底）** Coding Plan JWT | 三段点分 JWT | `zcode.z.ai/.../zcode-plan/anthropic` | ✅ 需要 | ⚠️ 撞 3012 账号级风控 |
+
+> 两种形态都只由同一次自包含网页 OAuth 登录产出。插件不读取 ZCode 桌面端登录态，不支持从 App、本地数据库或凭证文件导入凭据。
 
 ### 国内站优先（默认）
 
@@ -67,15 +72,15 @@ ZCode 的 Coding Plan 额度有**两条**可用路线，本插件默认走免验
 国际站需显式设置 `ZCODE_SITE=zai`：授权页 `chat.z.ai`，兑换先调 `api.z.ai/api/auth/z/login`，
 推理走 `api.z.ai/api/anthropic`。站点选择只影响 OAuth 与 API Key 路线；JWT 主端点两个站点相同。
 
-`pnpm run login` 默认走 **路线 A**：OAuth 授权后，把 `access_token` 兑换成一个名为
+`pnpm run login` 默认走 **形态 A**：OAuth 授权后，把 `access_token` 兑换成一个名为
 `zcode-api-key` 的长期 API Key，再用它打对应站点的 Anthropic 兼容端点——**全程不碰无痕验证**。
 这正是 ZCode 官方客户端自己在用的链路（逆向自本机 `app.asar`）。
 
-兑换失败时自动回退保存 JWT（路线 B），并告警该形态需要无痕验证。
+兑换失败时自动回退保存 JWT（形态 B），并告警该形态需要无痕验证。
 
-## ⚠️ 路线 B（JWT + 无痕验证）撞账号级风控
+## ⚠️ JWT 形态（路线 B）撞账号级风控
 
-如果你手上只有 Coding Plan 的 JWT、走路线 B，请注意：ZCode 的 zcode-plan 端点要求一个
+如果你手上只有 Coding Plan 的 JWT、走 JWT 形态，请注意：ZCode 的 zcode-plan 端点要求一个
 阿里云「无痕验证」签发的请求头。本插件用 Node + jsdom 跑阿里云官方 SDK 求这个参数，
 链路本身是通的（SDK 加载 → 设备指纹请求 → 拿到 `certifyId`）。
 
@@ -84,7 +89,7 @@ ZCode 的 Coding Plan 额度有**两条**可用路线，本插件默认走免验
 - **当前阻塞是 ESA WAF 的账号/IP 维度风控**：`400 code:3007` / `3012 unusual activity`，
   同一账号在本机反复求解后被判异常。这不是 jsdom 指纹问题，继续调桩没有意义
 
-**所以路线 B 当前仍不可用，请用路线 A（`pnpm run login` 默认即是）。**
+**所以 JWT 形态当前仍不可用，请用默认的 OAuth 兑换形态（`pnpm run login` 默认即是）。**
 详见 [docs/reverse/ZCODE_REVERSE.md](./docs/reverse/ZCODE_REVERSE.md) 第 6.7 节与
 [docs/DECISIONS.md](./docs/DECISIONS.md) D-9 / D-10。
 
@@ -95,12 +100,12 @@ ZCode 的 Coding Plan 额度有**两条**可用路线，本插件默认走免验
   转发 / 聚合 / 错误映射 / 兑换链（国内站 3 步、国际站 4 步）/ 模型自动发现 /
   注册载荷 / 凭证故障转移由 `pnpm e2e` 的 69 条离线断言覆盖并全绿。
 - **已知限制**：
-  - **路线 A（国内站）已完成真实账号验证的登录、兑换与鉴权**：`/copy` 兑换链成功产出
+  - **OAuth 兑换形态（路线 A，国内站）已完成真实账号验证的登录、兑换与鉴权**：`/copy` 兑换链成功产出
     `apiKeyId.secretKey`；`capture-key` 探活 `open.bigmodel.cn/api/paas/v4/models` → 200；
     真实推理请求返回上游 `429 code:1310「您已达到每周/每月使用上限」`（重置时间
     2026-10-22 11:23:27），而非 401——说明 key 已通过鉴权并绑定账户套餐额度。
     额度重置后的成功生成与计费扣减明细仍待复测，见 `docs/reverse` 第 7 节
-  - 路线 B（JWT + 无痕验证）撞账号/IP 级 `3012` 风控，见上一节
+  - JWT 形态（路线 B）撞账号/IP 级 `3012` 风控，见上一节
   - 额度 / 计费字段结构基于社区观测，不同套餐可能有差异
 
 ## 核心技术

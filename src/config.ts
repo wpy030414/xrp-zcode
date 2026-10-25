@@ -62,7 +62,7 @@ function parseKeyList(raw: string): string[] {
     .filter(Boolean);
 }
 
-export const PLUGIN_ID = 'xrl-router-plugin-zcode';
+export const PLUGIN_ID = 'plugin-zcode';
 
 /** 注册给 xrl-router 的供应商类型：告诉 router「本上游说的是 Anthropic Messages」 */
 export const PROVIDER_KIND = 'messages';

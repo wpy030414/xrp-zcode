@@ -379,3 +379,22 @@ BigModel（`bigmodel.cn` / `open.bigmodel.cn`）。
 
 **何时重新审视**：若复测发现扣减走的是另计 API 余额，回到 D-10 的结论重新评估；
 若 BigModel 兑换链在真实账号上失效，可切回 `ZCODE_SITE=zai`，或依赖 `login` 的 JWT 兜底。
+
+## D-13: 更名为 xrp-zcode，登录方式收敛为自包含网页 OAuth
+
+**背景**：项目从旧项目名升级为 `xrp-zcode`。新定位只有一句话：**登录唯一走自包含网页 OAuth**——不依赖 ZCode 桌面端，不读取本地登录态。旧名散落在 `package.json`、README / AGENTS / docs 标题、注册用的 `plugin_id` 以及脚本日志里。
+
+**决策**：
+
+- 项目名统一为 `xrp-zcode`：`package.json`、README、AGENTS、docs 标题与 `.env.example` 头注释。
+- `plugin_id` 改为 `plugin-zcode`，对齐 V24 的 `plugin-<name>` 命名约定（与 `plugin-qwenwork` / `plugin-workbuddy` 一致）。
+- 登录唯一入口固定为 `pnpm run login`：OAuth init → 浏览器授权（默认 `bigmodel.cn`）→ 轮询 ready → 兑换站点 API Key → 写入 `.env`。
+- 不新增 App 登录态解密、本地数据库读取、凭证文件抓取等旁路。兑换失败回退 JWT 仍来自**同一次 OAuth 登录**，属于凭证形态回退，不是第二种登录方式。
+- 只使用本机登录用户自己的账号；抓取 / 复用他人凭证一律禁止。
+
+**代价**：
+
+- router 侧看到的 `plugin_id` 从旧值变为 `plugin-zcode`，升级后需要在 router 界面重新确认 / 启用一次 provider。
+- 文档需采用「一次登录，两种凭证形态」的叙事，避免把路线 A / B 误读成两种登录方式。
+
+**何时重新审视**：若官方提供新的网页登录端点或取消 OAuth CLI 轮询，再评估替换；在用户明确要求前，不添加任何 App / 本地登录态旁路。

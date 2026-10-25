@@ -4,6 +4,8 @@
 
 两个脚本：`pnpm run login` 拿 Coding Plan 凭证，`pnpm capture-key` 校验凭证并查额度。
 
+**登录方式唯一**：`pnpm run login` 的自包含网页 OAuth（浏览器授权 + 轮询取票）。不依赖 ZCode 桌面端，不读取 App 登录态、本地数据库或凭证文件；运行时只消费这次登录写入 `.env` 的凭证。
+
 实现：`scripts/login.ts`、`scripts/capture-key.ts`、`scripts/envFile.ts`（共享的 `.env` 读写与安全闸）。
 
 ## 行为
@@ -35,6 +37,7 @@
 - 写入前必须通过 `assertEnvIgnored()`：`git check-ignore .env` 不通过就中止
 - **默认国内站**（D-12）：`ZCODE_SITE=bigmodel`，授权在 `bigmodel.cn`，推理在 `open.bigmodel.cn`
 - **默认兑换 API Key**（路线 A），不是直接存 JWT：官方客户端对 Coding Plan 额度就是这么用的，且绕开无痕验证（D-10）
+- **登录入口唯一**（D-13）：只走本规格的网页 OAuth；不增加 App 登录态 / 本地凭证文件等旁路。兑换失败回退 JWT 仍是同一次登录的凭证形态回退
 - 兑换失败（如无默认机构/项目）→ **不静默吞掉**：回退保存 JWT 并明确告警该形态需要无痕验证、当前可能不可用
 - 若 `ready` 里既无 `access_token` 也无 `token` → 报错中止
 

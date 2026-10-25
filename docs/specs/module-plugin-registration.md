@@ -20,7 +20,7 @@
 ```jsonc
 {
   "type": "register",
-  "plugin_id": "xrl-router-plugin-zcode",
+  "plugin_id": "plugin-zcode",
   "provider": {
     "kind": "messages",                      // ← 关键：告诉 router 上游说的是 Anthropic Messages
     "base_url": "http://localhost:19065",
@@ -74,7 +74,7 @@
 
 ## 约束
 
-- `plugin_id` 必须是**插件名**而非 provider UUID —— router 用它作为 `plugins` 表主键做在线判定
+- `plugin_id` 必须是**插件名**而非 provider UUID —— router 用它作为 `plugins` 表主键做在线判定。本项目固定为 `plugin-zcode`（V24 命名约定）
 - 注册消息中的 `base_url` 端口必须与本地实际监听端口一致，否则 router 会打到空端口
 - WS 与转发链路**完全解耦**：WS 断开不影响已建立的本地转发能力
 - 注册前必须先解析模型清单（`startServer()` 里 `await fetchClientConfigs()`），避免推空清单

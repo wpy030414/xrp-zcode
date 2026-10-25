@@ -1,12 +1,14 @@
-# PRD — xrl-router-plugin-zcode
+# PRD — xrp-zcode
 
 ## 产品目标
 
 让 ZCode 的额度在 xrl-router 里变成一个**普通可路由的供应商**：客户端不必知道 ZCode、不必知道无痕验证、不必知道 JWT，只要知道一个模型别名。
 
+登录方式唯一：**自包含网页 OAuth**（`pnpm run login`，浏览器授权 + 轮询取票），不需要安装 ZCode 桌面端，也不读取任何本地登录态文件。
+
 ## 用户与使用场景
 
-- **目标用户**：已经在 xrl-router 里统一管理多个模型供应商、手上有一份 ZCode 额度（免费额度或 Coding Plan）的人。**默认服务国内用户**：登录与免验证码推理均走国内站 BigModel（`bigmodel.cn` / `open.bigmodel.cn`），国际站 Z.AI 需显式设置 `ZCODE_SITE=zai`。
+- **目标用户**：已经在 xrl-router 里统一管理多个模型供应商、手上有一份 ZCode 额度（免费额度或 Coding Plan）的人。**默认服务国内用户**：登录与免验证码推理均走国内站 BigModel（`bigmodel.cn` / `open.bigmodel.cn`），国际站 Z.AI 需显式设置 `ZCODE_SITE=zai`。登录唯一走 `pnpm run login` 的自包含网页 OAuth，无需安装 ZCode 桌面端。
 - **典型场景**：
   1. 在 CCSwitch / Claude Code / 任意 OpenAI 兼容客户端里，像调用其他模型一样调用 ZCode 提供的模型
   2. 把 ZCode 的额度挂进 xrl-router 的组合（combo）里，与其他供应商一起做故障转移
@@ -36,13 +38,13 @@ ZCode 的上游是私有 Anthropic Messages 端点，且对 Coding Plan 凭证�
 | 非流式聚合 | 兼容非流式客户端 | 上游一律流式请求，非流式由插件聚合 |
 | 模型名归一化 | 上游模型名大小写敏感 | 客户端可以用好写的别名，上游拿到的是正确大小写 |
 | 模型清单自动发现 | 上游模型集会变，硬编码必过期 | 零配置可用；用户想自定义别名时再用 `ZCODE_MODELS` 覆盖 |
-| OAuth 登录脚本 | 拿免验证码凭证 | 默认国内站 BigModel：OAuth → 兑换 `open.bigmodel.cn` API Key；`ZCODE_SITE=zai` 时走国际站；失败回退 JWT |
+| 自包含网页 OAuth 登录（唯一登录方式） | 拿免验证码凭证 | 默认国内站 BigModel：浏览器授权 → 轮询取票 → 兑换 `open.bigmodel.cn` API Key；`ZCODE_SITE=zai` 时走国际站；兑换失败回退 JWT（同一次登录产出） |
 | 凭证体检脚本 | 判断凭证是否还有效/还有多少额度 | 排查「打不通」时先分清是凭证问题还是插件问题 |
 
 ## 功能之间的关系
 
 ```
-pnpm run login ──写──▶ .env(ZCODE_KEYS)
+pnpm run login（唯一登录入口）──写──▶ .env(ZCODE_KEYS)
                       │
 pnpm serve ───────────┴──▶ 读自持凭证；register（无 keys）→ xrl-router
                       │
@@ -54,7 +56,7 @@ pnpm e2e ── mock 上游 + mock router，不依赖上面任何真实凭证
 
 ## 范围与非目标
 
-**范围内**：转发、验证码、注册、登录、体检、离线自测、按配置顺序的凭证故障转移。
+**范围内**：转发、验证码、注册、登录（自包含网页 OAuth）、体检、离线自测、按配置顺序的凭证故障转移。
 
 **范围外**：
 
@@ -62,4 +64,5 @@ pnpm e2e ── mock 上游 + mock router，不依赖上面任何真实凭证
 - 协议转换（OpenAI / Responses ↔ Messages）—— router 的 IR 层已有
 - 多账号轮询与额度监控 —— 只做请求级顺序顺延，长期额度由使用者维护 `.env`
 - 本地模型推理 —— 纯桥接
+- App / 本地登录态导入 —— 登录唯一入口是自包含网页 OAuth，不读取 ZCode 桌面端或本地凭证文件
 - 另计费的付费 API Key 购买 / 管理 —— 兑换出的是消耗订阅额度的 `zcode-api-key`

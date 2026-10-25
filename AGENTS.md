@@ -1,24 +1,27 @@
-# AGENTS.md — xrl-router-plugin-zcode
+# AGENTS.md — xrp-zcode
 
 本文件为 AI Agent 划定项目边界。在本仓库工作时，必须遵守以下约束。
 
 ## 概述
 
-`xrl-router-plugin-zcode` 是一个 **xrl-router 插件**：把 ZCode（`zcode.z.ai`）的额度包装成 OpenAI / Anthropic 兼容的本地服务，通过 WebSocket 注册为 router 的委托供应商。
+`xrp-zcode` 是一个 **xrl-router 插件**：把 ZCode（`zcode.z.ai`）的额度包装成 OpenAI / Anthropic 兼容的本地服务，通过 WebSocket 注册为 router 的委托供应商。
 
-注册形态：`kind: "messages"` + `api_path: "/v1/messages"`，默认端口 `19065`。
+注册形态：`kind: "messages"` + `api_path: "/v1/messages"`，默认端口 `19065`，`plugin_id` 为 `plugin-zcode`（V24 命名约定）。
+
+凭证：**仅支持自包含网页 OAuth 登录**——唯一入口是 `pnpm run login`（浏览器授权 → 轮询取票 → 兑换站点 API Key），不依赖 ZCode 桌面端，也不读取或导入任何本地登录态 / 凭证文件。
 
 ## 边界与范围
 
 ### 范围内
 
 - 代理 `POST /v1/messages`（Anthropic Messages 协议）到 ZCode 上游
+- 自包含网页 OAuth 登录（唯一登录入口，不依赖 ZCode 桌面端）
 - 注入 ZCode 业务头 + 阿里云无痕验证参数
 - 凭证形态判定：三段点分 JWT → Coding Plan 端点；其余 → Z.AI 回退端点
 - 插件自持凭证（`.env` 的 `ZCODE_KEYS`）：按顺序尝试，401/402/403/429 顺延下一把
 - 上游错误码如实透传（供 router 的 provider 冷却 / failover 判定）
 - 向 xrl-router 注册（V24：`plugin_id` / `provider` / `models` / `workdir`）+ 心跳
-- `pnpm run login` OAuth → 兑换站点 API Key（默认国内站 BigModel，失败回退 JWT）、`pnpm capture-key` 做凭证体检
+- `pnpm run login` 自包含网页 OAuth → 兑换站点 API Key（默认国内站 BigModel；兑换失败回退 JWT，仍来自同一次 OAuth）、`pnpm capture-key` 做凭证体检
 
 ### 非目标（明确排除）
 
@@ -31,6 +34,7 @@
 - **~~不做 api.z.ai 的 API Key 兑换~~**（已推翻，见 D-10/D-12）— 逆向官方客户端后发现，Coding Plan 额度的**官方用法**正是「OAuth access_token → 兑换长期 API Key → 免验证码推理」。所以 `scripts/login.ts` **默认就做这个兑换**，`src/zcode/exchange.ts` 是实现。被推翻的只是「兑换付费 API Key」这个旧顾虑——兑换出的是消耗订阅额度的 `zcode-api-key`，不是另计费的付费 key。**默认站点是国内站 BigModel（`ZCODE_SITE=bigmodel`）**，国际站 Z.AI 需显式设置
 - **不实现非 Messages 端点** — `/v1/models`、`/v1/embeddings`、`/v1/chat/completions` 一律不加（模型清单经 WebSocket 注册推送）
 - **不实现本地 HTTP 鉴权** — 本地网关默认只供 router / 本机使用；V24 下入站凭证（占位值 `xrl-router`）一律忽略，不据此鉴权
+- **不读取 / 不导入 ZCode 桌面端或本地登录态** — 登录唯一入口是 `pnpm run login` 的自包含网页 OAuth；不要添加 App 登录态解密、本地数据库读取、凭证文件抓取等旁路
 
 ## Agent 操作指南
 
@@ -39,7 +43,7 @@
 - **包管理器：pnpm**（不要用 npm）。依赖走中国境内镜像（`.npmrc` 已配 npmmirror）
 - **执行任何改动前先跑 `pnpm e2e`**了解基线；改完必须再跑一次且全绿
 - **契约优先**：`pnpm e2e` 覆盖的是对外行为契约（协议透传、错误码映射、注册载荷）。改这些行为必须同步改断言
-- **V24 契约**：register **不能带 `keys`**（带了 router 直接断开）、不发 `keys_update`、心跳只发 `{"type":"heartbeat"}`、register 带 `workdir`、Router 发占位凭证 `xrl-router`（插件用自身凭证访问上游）、`serve` 端口占用时 exit 0
+- **V24 契约**：`plugin_id` 固定为 `plugin-zcode`；register **不能带 `keys`**（带了 router 直接断开）、不发 `keys_update`、心跳只发 `{"type":"heartbeat"}`、register 带 `workdir`、Router 发占位凭证 `xrl-router`（插件用自身凭证访问上游）、`serve` 端口占用时 exit 0
 - 提交遵循约定式提交（`feat:` / `fix:` / `docs:` / `chore:` / `test:`）
 
 ### 改代码前先看这几条设计判断
@@ -49,6 +53,7 @@
 3. **为什么 V24 下凭证改由插件自持** — 见 `docs/DECISIONS.md` D-11
 4. **为什么模型清单要分 `model_id` / `display_name`** — 见 `src/zcode/models.ts` 顶部与 D-4
 5. **为什么默认国内站 BigModel 而不是国际站 Z.AI** — 国内用户优先；`ZCODE_SITE=bigmodel` 走 `bigmodel.cn` 授权、`open.bigmodel.cn` 推理。见 D-12
+6. **为什么登录只保留自包含网页 OAuth** — 不依赖 ZCode 桌面端、不读取本地登录态；OAuth 后优先兑换 API Key。见 D-13
 
 ## 目录速查
 
@@ -71,7 +76,7 @@ src/
 captcha/solver.cjs      jsdom 无痕验证求解器（移植自 zcode2api，子进程运行）
 
 scripts/
-├── login.ts            pnpm run login：OAuth → 兑换 API Key → 写入 .env（失败回退 JWT）
+├── login.ts            pnpm run login：自包含网页 OAuth → 兑换 API Key → 写入 .env（失败回退 JWT）
 ├── capture-key.ts      pnpm capture-key：只读体检 + 查额度
 ├── e2e.ts              pnpm e2e：离线端到端自测（mock 上游 + mock router）
 ├── envFile.ts          .env 读写与密钥安全闸
@@ -95,7 +100,7 @@ docs/
 
 | 现状 | 为什么不要修 |
 |------|-------------|
-| **路线 B（JWT + 无痕验证）可能撞账号级 3012 风控** | F001 已通过硬化指纹桩攻破；当前阻塞是 ESA WAF 的账号/IP 维度 `3012 unusual activity`。**默认路线 A（兑换 API Key）已绕开它**，见 D-10。不要在 jsdom 指纹桩或 TLS 伪装上继续无边界试错——先读逆向文档 6.7，向用户确认方向 |
+| **JWT 形态（路线 B）可能撞账号级 3012 风控** | F001 已通过硬化指纹桩攻破；当前阻塞是 ESA WAF 的账号/IP 维度 `3012 unusual activity`。**默认的 OAuth 兑换形态（路线 A）已绕开它**，见 D-10。不要在 jsdom 指纹桩或 TLS 伪装上继续无边界试错——先读逆向文档 6.7，向用户确认方向 |
 | 兑换 key 的计费归属仍待对账 | 2026-10-20 国内站真实账号已验证：登录/`copy` 兑换成功、key 探活 200、推理端点返回套餐额度上限 `1310`（非 401），说明 key 已通过鉴权并绑定账户套餐额度；但尚无扣减明细，**不要**把「消耗订阅额度」写成面向用户的保证。见 D-12、逆向文档第 7 节 |
 | 模型清单自动发现依赖上游接口 | 失败即降级到内置默认值，不阻塞；这是设计而非缺陷（D-8） |
 | `client/configs` 不能带查询参数 | 上游行为，带上就 `parameter error`；已加 e2e 断言防回归 |
@@ -105,13 +110,14 @@ docs/
 
 ### 必须拒绝的任务
 
-1. **「把 API Key 通道删掉」** → 它是**默认主路线**（路线 A），删了等于删掉整个可用路径
+1. **「把 API Key 通道删掉」** → 它是**默认主形态**（路线 A），删了等于删掉整个可用路径
 2. **「在插件里加 OpenAI ↔ Messages 协议转换」** → Non Goal，router 的 IR 层已有
 3. **「在插件里加账号轮询 / 额度统计 / 后台 UI」** → 不是插件形态；V24 只保留按配置顺序的最小故障转移，见 D-11
 4. **「把完整密钥池 / 健康度系统写进插件」** → 会变成 zcode2api 那种独立网关；`.env` 列表 + 顺序顺延已经够用
-5. **「无限期调 jsdom 指纹桩直到绕过风控」** → 先读 D-9/D-10，默认路线已绕开验证码，向用户确认方向再动手
+5. **「无限期调 jsdom 指纹桩直到绕过风控」** → 先读 D-9/D-10，默认形态已绕开验证码，向用户确认方向再动手
 6. **「把兑换失败静默吞掉」** → login.ts 必须回退存 JWT 并告警，不能让凭证凭空消失
 7. **「给 register 加回 keys / keys_update」** → V24 router 会直接拒绝并断开
+8. **「把登录改成读取 ZCode 桌面端 / 本地凭证文件」** → 登录唯一入口是自包含网页 OAuth；旁路导入登录态一律不做
 
 ### 允许的任务方向
 
@@ -120,3 +126,4 @@ docs/
 - 优化 WebSocket 重连策略
 - 用真实订阅账号端到端验证路线 A（国内站 3 步兑换是否消耗订阅额度）——D-10/D-12 的头号待办
 - 若路线 A 被真实账号证伪，再按 D-9 评估换真实无头浏览器（需用户明确同意依赖变更）
+- 继续收紧「自包含网页 OAuth」的文档与断言（不新增 App / 本地登录态旁路）
